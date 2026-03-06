@@ -5854,3 +5854,1003 @@ class SecurityManager:
             (user_id,),
         )
 
+
+# =============================================================================
+# SECTION 8: REPORTING ENGINE
+# =============================================================================
+
+
+class ReportEngine(BaseService):
+    """Comprehensive reporting engine for generating payroll, employee,
+    invoice, and financial reports in PDF, Excel, and CSV formats.
+
+    Supports ZATCA-compliant invoice rendering and standard Saudi
+    financial statements (Trial Balance, Profit & Loss, Balance Sheet).
+    """
+
+    # Report output directory prefix
+    _REPORT_PREFIX = "erp_report_"
+
+    def __init__(self, db: DatabaseManager):
+        super().__init__(db)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def generate_payroll_report(
+        self, run_id: int, format: str = "pdf"
+    ) -> str:
+        """Generate a payroll report for a specific payroll run.
+
+        Args:
+            run_id: ID of the payroll run.
+            format: Output format – 'pdf', 'excel', or 'csv'.
+
+        Returns:
+            Absolute path to the generated report file.
+
+        Raises:
+            ValueError: If the payroll run does not exist.
+        """
+        run = self.db.fetchone(
+            "SELECT pr.id, pr.period_id, pr.status, pr.total_employees, "
+            "pr.total_gross, pr.total_net "
+            "FROM payroll_runs pr WHERE pr.id = ?",
+            (run_id,),
+        )
+        if not run:
+            raise ValueError(f"Payroll run {run_id} not found")
+
+        period = self.db.fetchone(
+            "SELECT period_name, period_year, period_month "
+            "FROM payroll_periods WHERE id = ?",
+            (run["period_id"],),
+        )
+        period_label = (
+            period["period_name"]
+            if period
+            else f"Period {run['period_id']}"
+        )
+
+        entries = self.db.fetchall(
+            "SELECT pe.employee_id, e.emp_number, "
+            "e.first_name || ' ' || e.last_name AS employee_name, "
+            "pe.basic_salary, pe.gross_salary, pe.net_salary, "
+            "pe.gosi_employee, pe.gosi_employer, pe.total_deductions, "
+            "COALESCE(pe.gross_salary - pe.basic_salary, 0) AS allowances "
+            "FROM payroll_entries pe "
+            "JOIN employees e ON pe.employee_id = e.id "
+            "WHERE pe.payroll_run_id = ? "
+            "ORDER BY e.emp_number",
+            (run_id,),
+        )
+
+        headers = [
+            "Emp #", "Employee Name", "Basic Salary", "Allowances",
+            "Gross Salary", "GOSI (Emp)", "Deductions", "Net Salary",
+        ]
+        rows: List[list] = []
+        totals = [Decimal(0)] * 6
+        for e in entries:
+            basic = Decimal(str(e["basic_salary"] or 0))
+            allowances = Decimal(str(e["allowances"] or 0))
+            gross = Decimal(str(e["gross_salary"] or 0))
+            gosi_emp = Decimal(str(e["gosi_employee"] or 0))
+            deductions = Decimal(str(e["total_deductions"] or 0))
+            net = Decimal(str(e["net_salary"] or 0))
+            rows.append([
+                e["emp_number"],
+                e["employee_name"],
+                f"{basic:,.2f}",
+                f"{allowances:,.2f}",
+                f"{gross:,.2f}",
+                f"{gosi_emp:,.2f}",
+                f"{deductions:,.2f}",
+                f"{net:,.2f}",
+            ])
+            totals[0] += basic
+            totals[1] += allowances
+            totals[2] += gross
+            totals[3] += gosi_emp
+            totals[4] += deductions
+            totals[5] += net
+
+        rows.append([
+            "", "TOTALS",
+            f"{totals[0]:,.2f}", f"{totals[1]:,.2f}",
+            f"{totals[2]:,.2f}", f"{totals[3]:,.2f}",
+            f"{totals[4]:,.2f}", f"{totals[5]:,.2f}",
+        ])
+
+        title = f"Payroll Report – {period_label}"
+        filename = f"payroll_run_{run_id}"
+
+        return self._render_report(
+            headers, rows, title, filename, format,
+            subtitle=f"Run #{run_id} | Status: {run['status']} | "
+                     f"Employees: {run['total_employees']}",
+        )
+
+    def generate_employee_report(
+        self, company_id: int, format: str = "pdf"
+    ) -> str:
+        """Generate an active-employee roster report for a company.
+
+        Args:
+            company_id: ID of the company.
+            format: Output format – 'pdf', 'excel', or 'csv'.
+
+        Returns:
+            Absolute path to the generated report file.
+        """
+        employees = self.db.fetchall(
+            "SELECT e.emp_number, "
+            "e.first_name || ' ' || e.last_name AS employee_name, "
+            "CASE WHEN e.is_saudi = 1 THEN 'Saudi' ELSE 'Non-Saudi' END "
+            "  AS nationality, "
+            "e.id_number, e.job_title, "
+            "COALESCE(d.name, '') AS department, "
+            "e.hire_date, e.basic_salary, "
+            "COALESCE(e.total_salary, e.basic_salary) AS total_salary "
+            "FROM employees e "
+            "LEFT JOIN departments d ON e.department_id = d.id "
+            "WHERE e.company_id = ? AND e.is_active = 1 "
+            "ORDER BY e.emp_number",
+            (company_id,),
+        )
+
+        headers = [
+            "Emp #", "Name", "Nationality", "ID Number",
+            "Job Title", "Department", "Hire Date",
+            "Basic Salary", "Total Salary",
+        ]
+        rows: List[list] = []
+        for emp in employees:
+            rows.append([
+                emp["emp_number"],
+                emp["employee_name"],
+                emp["nationality"],
+                emp.get("id_number", ""),
+                emp.get("job_title", ""),
+                emp["department"],
+                emp.get("hire_date", ""),
+                f"{Decimal(str(emp['basic_salary'] or 0)):,.2f}",
+                f"{Decimal(str(emp['total_salary'] or 0)):,.2f}",
+            ])
+
+        company = self.db.fetchone(
+            "SELECT name FROM companies WHERE id = ?", (company_id,)
+        )
+        company_name = company["name"] if company else "Company"
+        title = f"Employee Roster – {company_name}"
+        filename = f"employees_company_{company_id}"
+
+        return self._render_report(headers, rows, title, filename, format)
+
+    def generate_invoice_report(
+        self, invoice_id: int, format: str = "pdf"
+    ) -> str:
+        """Generate a formatted invoice document.
+
+        Args:
+            invoice_id: ID of the invoice.
+            format: Output format – 'pdf', 'excel', or 'csv'.
+
+        Returns:
+            Absolute path to the generated report file.
+
+        Raises:
+            ValueError: If the invoice does not exist.
+        """
+        invoice = self.db.fetchone(
+            "SELECT i.id, i.invoice_number, i.invoice_date, i.client_id, "
+            "i.subtotal, i.vat_amount, i.total_amount, i.status, "
+            "i.company_id "
+            "FROM invoices i WHERE i.id = ?",
+            (invoice_id,),
+        )
+        if not invoice:
+            raise ValueError(f"Invoice {invoice_id} not found")
+
+        client = self.db.fetchone(
+            "SELECT name FROM clients WHERE id = ?",
+            (invoice["client_id"],),
+        )
+        company = self.db.fetchone(
+            "SELECT name, name_ar, vat_number, commercial_registration "
+            "FROM companies WHERE id = ?",
+            (invoice.get("company_id", 0),),
+        )
+        lines = self.db.fetchall(
+            "SELECT description, quantity, unit_price, total "
+            "FROM invoice_lines WHERE invoice_id = ?",
+            (invoice_id,),
+        )
+
+        headers = ["#", "Description", "Qty", "Unit Price", "Total"]
+        rows: List[list] = []
+        for idx, line in enumerate(lines, 1):
+            rows.append([
+                str(idx),
+                line["description"],
+                str(line["quantity"]),
+                f"{Decimal(str(line['unit_price'] or 0)):,.2f}",
+                f"{Decimal(str(line['total'] or 0)):,.2f}",
+            ])
+
+        subtotal = Decimal(str(invoice["subtotal"] or 0))
+        vat = Decimal(str(invoice["vat_amount"] or 0))
+        total = Decimal(str(invoice["total_amount"] or 0))
+
+        rows.append(["", "", "", "Subtotal", f"{subtotal:,.2f}"])
+        rows.append(["", "", "", "VAT (15%)", f"{vat:,.2f}"])
+        rows.append(["", "", "", "Total", f"{total:,.2f}"])
+
+        company_name = company["name"] if company else "Company"
+        client_name = client["name"] if client else "Client"
+
+        if format == "pdf" and HAS_REPORTLAB:
+            return self._generate_invoice_pdf(
+                invoice, company, client_name, lines,
+                subtotal, vat, total,
+            )
+
+        title = (
+            f"Invoice {invoice['invoice_number']} – {company_name}"
+        )
+        filename = f"invoice_{invoice['invoice_number']}"
+        return self._render_report(
+            headers, rows, title, filename, format,
+            subtitle=f"Client: {client_name} | Date: "
+                     f"{invoice['invoice_date']} | "
+                     f"Status: {invoice['status']}",
+        )
+
+    def generate_financial_report(
+        self,
+        company_id: int,
+        report_type: str,
+        start_date: str,
+        end_date: str,
+        format: str = "pdf",
+    ) -> str:
+        """Generate a financial statement.
+
+        Args:
+            company_id: ID of the company.
+            report_type: One of 'trial_balance', 'profit_loss',
+                         or 'balance_sheet'.
+            start_date: Start of reporting period (YYYY-MM-DD).
+            end_date: End of reporting period (YYYY-MM-DD).
+            format: Output format – 'pdf', 'excel', or 'csv'.
+
+        Returns:
+            Absolute path to the generated report file.
+
+        Raises:
+            ValueError: If *report_type* is unrecognised.
+        """
+        valid_types = ("trial_balance", "profit_loss", "balance_sheet")
+        if report_type not in valid_types:
+            raise ValueError(
+                f"Invalid report_type '{report_type}'. "
+                f"Must be one of {valid_types}"
+            )
+
+        company = self.db.fetchone(
+            "SELECT name FROM companies WHERE id = ?", (company_id,)
+        )
+        company_name = company["name"] if company else "Company"
+
+        if report_type == "trial_balance":
+            return self._generate_trial_balance(
+                company_id, company_name, start_date, end_date, format,
+            )
+        elif report_type == "profit_loss":
+            return self._generate_profit_loss(
+                company_id, company_name, start_date, end_date, format,
+            )
+        else:
+            return self._generate_balance_sheet(
+                company_id, company_name, start_date, end_date, format,
+            )
+
+    # ------------------------------------------------------------------
+    # Financial sub-reports
+    # ------------------------------------------------------------------
+
+    def _generate_trial_balance(
+        self,
+        company_id: int,
+        company_name: str,
+        start_date: str,
+        end_date: str,
+        format: str,
+    ) -> str:
+        """Build a trial-balance report."""
+        rows_data = self.db.fetchall(
+            "SELECT coa.account_code, coa.account_name, "
+            "COALESCE(SUM(jel.debit), 0) AS total_debit, "
+            "COALESCE(SUM(jel.credit), 0) AS total_credit "
+            "FROM journal_entry_lines jel "
+            "JOIN chart_of_accounts coa ON jel.account_id = coa.id "
+            "JOIN journal_entries je ON jel.entry_id = je.id "
+            "WHERE je.company_id = ? "
+            "AND je.entry_date BETWEEN ? AND ? "
+            "AND je.status = 'posted' "
+            "GROUP BY coa.account_code, coa.account_name "
+            "ORDER BY coa.account_code",
+            (company_id, start_date, end_date),
+        )
+
+        headers = ["Account Code", "Account Name", "Debit", "Credit", "Balance"]
+        rows: List[list] = []
+        total_debit = Decimal(0)
+        total_credit = Decimal(0)
+        for r in rows_data:
+            debit = Decimal(str(r["total_debit"]))
+            credit = Decimal(str(r["total_credit"]))
+            balance = debit - credit
+            rows.append([
+                r["account_code"],
+                r["account_name"],
+                f"{debit:,.2f}",
+                f"{credit:,.2f}",
+                f"{balance:,.2f}",
+            ])
+            total_debit += debit
+            total_credit += credit
+
+        rows.append([
+            "", "TOTALS",
+            f"{total_debit:,.2f}",
+            f"{total_credit:,.2f}",
+            f"{total_debit - total_credit:,.2f}",
+        ])
+
+        title = f"Trial Balance – {company_name}"
+        filename = f"trial_balance_{company_id}_{start_date}_{end_date}"
+        return self._render_report(
+            headers, rows, title, filename, format,
+            subtitle=f"Period: {start_date} to {end_date}",
+        )
+
+    def _generate_profit_loss(
+        self,
+        company_id: int,
+        company_name: str,
+        start_date: str,
+        end_date: str,
+        format: str,
+    ) -> str:
+        """Build a profit-and-loss report."""
+        revenue_rows = self.db.fetchall(
+            "SELECT coa.account_code, coa.account_name, "
+            "COALESCE(SUM(jel.credit), 0) - COALESCE(SUM(jel.debit), 0) "
+            "  AS net_amount "
+            "FROM journal_entry_lines jel "
+            "JOIN chart_of_accounts coa ON jel.account_id = coa.id "
+            "JOIN journal_entries je ON jel.entry_id = je.id "
+            "WHERE je.company_id = ? "
+            "AND je.entry_date BETWEEN ? AND ? "
+            "AND je.status = 'posted' "
+            "AND coa.account_type = 'revenue' "
+            "GROUP BY coa.account_code, coa.account_name "
+            "ORDER BY coa.account_code",
+            (company_id, start_date, end_date),
+        )
+        expense_rows = self.db.fetchall(
+            "SELECT coa.account_code, coa.account_name, "
+            "COALESCE(SUM(jel.debit), 0) - COALESCE(SUM(jel.credit), 0) "
+            "  AS net_amount "
+            "FROM journal_entry_lines jel "
+            "JOIN chart_of_accounts coa ON jel.account_id = coa.id "
+            "JOIN journal_entries je ON jel.entry_id = je.id "
+            "WHERE je.company_id = ? "
+            "AND je.entry_date BETWEEN ? AND ? "
+            "AND je.status = 'posted' "
+            "AND coa.account_type = 'expense' "
+            "GROUP BY coa.account_code, coa.account_name "
+            "ORDER BY coa.account_code",
+            (company_id, start_date, end_date),
+        )
+
+        headers = ["Account Code", "Account Name", "Amount (SAR)"]
+        rows: List[list] = []
+
+        rows.append(["", "--- REVENUE ---", ""])
+        total_revenue = Decimal(0)
+        for r in revenue_rows:
+            amt = Decimal(str(r["net_amount"]))
+            rows.append([r["account_code"], r["account_name"], f"{amt:,.2f}"])
+            total_revenue += amt
+        rows.append(["", "Total Revenue", f"{total_revenue:,.2f}"])
+
+        rows.append(["", "--- EXPENSES ---", ""])
+        total_expenses = Decimal(0)
+        for r in expense_rows:
+            amt = Decimal(str(r["net_amount"]))
+            rows.append([r["account_code"], r["account_name"], f"{amt:,.2f}"])
+            total_expenses += amt
+        rows.append(["", "Total Expenses", f"{total_expenses:,.2f}"])
+
+        net_income = total_revenue - total_expenses
+        rows.append(["", "NET INCOME", f"{net_income:,.2f}"])
+
+        title = f"Profit & Loss – {company_name}"
+        filename = f"profit_loss_{company_id}_{start_date}_{end_date}"
+        return self._render_report(
+            headers, rows, title, filename, format,
+            subtitle=f"Period: {start_date} to {end_date}",
+        )
+
+    def _generate_balance_sheet(
+        self,
+        company_id: int,
+        company_name: str,
+        start_date: str,
+        end_date: str,
+        format: str,
+    ) -> str:
+        """Build a balance-sheet report."""
+        account_data = self.db.fetchall(
+            "SELECT coa.account_code, coa.account_name, "
+            "coa.account_type, "
+            "COALESCE(SUM(jel.debit), 0) AS total_debit, "
+            "COALESCE(SUM(jel.credit), 0) AS total_credit "
+            "FROM journal_entry_lines jel "
+            "JOIN chart_of_accounts coa ON jel.account_id = coa.id "
+            "JOIN journal_entries je ON jel.entry_id = je.id "
+            "WHERE je.company_id = ? "
+            "AND je.entry_date <= ? "
+            "AND je.status = 'posted' "
+            "GROUP BY coa.account_code, coa.account_name, "
+            "         coa.account_type "
+            "ORDER BY coa.account_code",
+            (company_id, end_date),
+        )
+
+        headers = ["Account Code", "Account Name", "Amount (SAR)"]
+        rows: List[list] = []
+        section_totals: Dict[str, Decimal] = defaultdict(Decimal)
+
+        sections = {
+            "asset": "ASSETS",
+            "liability": "LIABILITIES",
+            "equity": "EQUITY",
+        }
+        grouped: Dict[str, list] = defaultdict(list)
+        for acct in account_data:
+            atype = acct["account_type"]
+            grouped[atype].append(acct)
+
+        for atype, label in sections.items():
+            rows.append(["", f"--- {label} ---", ""])
+            for acct in grouped.get(atype, []):
+                debit = Decimal(str(acct["total_debit"]))
+                credit = Decimal(str(acct["total_credit"]))
+                if atype == "asset":
+                    balance = debit - credit
+                else:
+                    balance = credit - debit
+                rows.append([
+                    acct["account_code"],
+                    acct["account_name"],
+                    f"{balance:,.2f}",
+                ])
+                section_totals[atype] += balance
+            rows.append(["", f"Total {label}", f"{section_totals[atype]:,.2f}"])
+
+        le_total = section_totals["liability"] + section_totals["equity"]
+        rows.append(["", "TOTAL LIABILITIES + EQUITY", f"{le_total:,.2f}"])
+
+        title = f"Balance Sheet – {company_name}"
+        filename = f"balance_sheet_{company_id}_{end_date}"
+        return self._render_report(
+            headers, rows, title, filename, format,
+            subtitle=f"As of {end_date}",
+        )
+
+    # ------------------------------------------------------------------
+    # Invoice-specific PDF generation
+    # ------------------------------------------------------------------
+
+    def _generate_invoice_pdf(
+        self,
+        invoice: dict,
+        company: Optional[dict],
+        client_name: str,
+        lines: List[dict],
+        subtotal: Decimal,
+        vat: Decimal,
+        total: Decimal,
+    ) -> str:
+        """Create a professional invoice PDF with optional ZATCA QR."""
+        filepath = os.path.join(
+            tempfile.gettempdir(),
+            f"{self._REPORT_PREFIX}invoice_{invoice['invoice_number']}.pdf",
+        )
+        doc = SimpleDocTemplate(filepath, pagesize=A4)
+        styles = getSampleStyleSheet()
+        elements: List[Any] = []
+
+        # Company header
+        company_name = company["name"] if company else "Company"
+        company_name_ar = company.get("name_ar", "") if company else ""
+        vat_number = company.get("vat_number", "") if company else ""
+        cr_number = (
+            company.get("commercial_registration", "") if company else ""
+        )
+
+        header_style = ParagraphStyle(
+            "InvoiceHeader", parent=styles["Heading1"],
+            fontSize=18, spaceAfter=6,
+        )
+        elements.append(Paragraph(company_name, header_style))
+        if company_name_ar:
+            elements.append(Paragraph(company_name_ar, styles["Heading2"]))
+        if vat_number:
+            elements.append(
+                Paragraph(f"VAT #: {vat_number}", styles["Normal"])
+            )
+        if cr_number:
+            elements.append(
+                Paragraph(f"CR #: {cr_number}", styles["Normal"])
+            )
+        elements.append(Spacer(1, 12))
+
+        # Invoice meta
+        meta_style = ParagraphStyle(
+            "InvoiceMeta", parent=styles["Normal"], fontSize=10,
+        )
+        elements.append(
+            Paragraph(
+                f"<b>Invoice:</b> {invoice['invoice_number']}", meta_style,
+            )
+        )
+        elements.append(
+            Paragraph(
+                f"<b>Date:</b> {invoice['invoice_date']}", meta_style,
+            )
+        )
+        elements.append(
+            Paragraph(f"<b>Client:</b> {client_name}", meta_style)
+        )
+        elements.append(
+            Paragraph(
+                f"<b>Status:</b> {invoice['status']}", meta_style,
+            )
+        )
+        elements.append(Spacer(1, 12))
+
+        # Line items table
+        table_data = [["#", "Description", "Qty", "Unit Price", "Total"]]
+        for idx, line in enumerate(lines, 1):
+            table_data.append([
+                str(idx),
+                line["description"],
+                str(line["quantity"]),
+                f"{Decimal(str(line['unit_price'] or 0)):,.2f}",
+                f"{Decimal(str(line['total'] or 0)):,.2f}",
+            ])
+
+        table_data.append(["", "", "", "Subtotal", f"{subtotal:,.2f}"])
+        table_data.append(["", "", "", "VAT (15%)", f"{vat:,.2f}"])
+        table_data.append(["", "", "", "Total (SAR)", f"{total:,.2f}"])
+
+        col_widths = [0.5 * inch, 3.0 * inch, 0.7 * inch, 1.2 * inch, 1.2 * inch]
+        table = Table(table_data, colWidths=col_widths)
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 9),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("ALIGN", (1, 1), (1, -1), "LEFT"),
+            ("GRID", (0, 0), (-1, -4), 0.5, colors.grey),
+            ("LINEABOVE", (3, -3), (-1, -3), 1, colors.black),
+            ("LINEABOVE", (3, -1), (-1, -1), 1.5, colors.black),
+            ("FONTNAME", (0, -3), (-1, -1), "Helvetica-Bold"),
+            ("BACKGROUND", (0, 1), (-1, -4), colors.HexColor("#ecf0f1")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -4),
+             [colors.white, colors.HexColor("#ecf0f1")]),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        elements.append(table)
+        elements.append(Spacer(1, 18))
+
+        # ZATCA TLV QR code
+        qr_data = self._build_zatca_tlv(
+            company_name, vat_number,
+            str(invoice["invoice_date"]),
+            str(total), str(vat),
+        )
+        if qr_data and HAS_QRCODE:
+            try:
+                qr_img = qrcode.make(qr_data)
+                buf = io.BytesIO()
+                qr_img.save(buf, format="PNG")
+                buf.seek(0)
+                elements.append(
+                    Paragraph("ZATCA QR Code:", styles["Heading4"])
+                )
+                elements.append(RLImage(buf, width=1.5 * inch, height=1.5 * inch))
+            except Exception as exc:
+                self._logger.warning("QR generation failed: %s", exc)
+
+        try:
+            doc.build(elements)
+        except Exception as exc:
+            self._logger.error("PDF build failed: %s", exc)
+            raise
+        self._logger.info("Invoice PDF generated: %s", filepath)
+        return filepath
+
+    # ------------------------------------------------------------------
+    # ZATCA TLV helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_zatca_tlv(
+        seller: str,
+        vat_number: str,
+        timestamp: str,
+        total: str,
+        vat_amount: str,
+    ) -> Optional[str]:
+        """Build a Base64-encoded ZATCA TLV string for QR codes.
+
+        Returns:
+            Base64 string or ``None`` when inputs are insufficient.
+        """
+        if not seller or not vat_number:
+            return None
+        try:
+            tlv = b""
+            for tag, value in [
+                (1, seller),
+                (2, vat_number),
+                (3, timestamp),
+                (4, total),
+                (5, vat_amount),
+            ]:
+                encoded = value.encode("utf-8")
+                tlv += bytes([tag, len(encoded)]) + encoded
+            return base64.b64encode(tlv).decode("ascii")
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # PDF header helper
+    # ------------------------------------------------------------------
+
+    def _create_pdf_header(
+        self, canvas_obj: Any, title: str, company_name: str
+    ) -> None:
+        """Draw a standard header on a reportlab canvas page.
+
+        Args:
+            canvas_obj: A ``reportlab.pdfgen.canvas.Canvas`` instance.
+            title: The report title.
+            company_name: Company name rendered above the title.
+        """
+        canvas_obj.saveState()
+        canvas_obj.setFont("Helvetica-Bold", 14)
+        page_w, _ = A4
+        canvas_obj.drawCentredString(
+            page_w / 2, 800, company_name,
+        )
+        canvas_obj.setFont("Helvetica", 11)
+        canvas_obj.drawCentredString(page_w / 2, 780, title)
+        canvas_obj.setFont("Helvetica", 8)
+        canvas_obj.drawRightString(
+            page_w - 40, 800,
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        )
+        canvas_obj.line(40, 775, page_w - 40, 775)
+        canvas_obj.restoreState()
+
+    # ------------------------------------------------------------------
+    # Unified rendering dispatcher
+    # ------------------------------------------------------------------
+
+    def _render_report(
+        self,
+        headers: List[str],
+        rows: List[list],
+        title: str,
+        filename: str,
+        format: str,
+        subtitle: str = "",
+    ) -> str:
+        """Route report generation to the appropriate format handler.
+
+        Args:
+            headers: Column header strings.
+            rows: Row data (list of lists).
+            title: Report title.
+            filename: Base filename (without extension).
+            format: 'pdf', 'excel', or 'csv'.
+            subtitle: Optional subtitle line.
+
+        Returns:
+            Absolute path to the generated file.
+        """
+        fmt = format.lower().strip()
+        if fmt == "pdf" and HAS_REPORTLAB:
+            return self._generate_pdf(headers, rows, title, filename, subtitle)
+        elif fmt == "excel" and HAS_OPENPYXL:
+            return self._generate_excel(headers, rows, title, filename)
+        else:
+            if fmt not in ("csv",) and fmt == "pdf" and not HAS_REPORTLAB:
+                self._logger.warning(
+                    "reportlab unavailable; falling back to CSV"
+                )
+            elif fmt not in ("csv",) and fmt == "excel" and not HAS_OPENPYXL:
+                self._logger.warning(
+                    "openpyxl unavailable; falling back to CSV"
+                )
+            return self._generate_csv_fallback(headers, rows, filename)
+
+    # ------------------------------------------------------------------
+    # PDF generation (reportlab)
+    # ------------------------------------------------------------------
+
+    def _generate_pdf(
+        self,
+        headers: List[str],
+        rows: List[list],
+        title: str,
+        filename: str,
+        subtitle: str = "",
+    ) -> str:
+        """Generate a PDF report using reportlab.
+
+        Args:
+            headers: Column headers.
+            rows: Data rows (list of lists).
+            title: Report title.
+            filename: Base filename.
+            subtitle: Optional subtitle.
+
+        Returns:
+            Absolute path to the PDF file.
+        """
+        filepath = os.path.join(
+            tempfile.gettempdir(),
+            f"{self._REPORT_PREFIX}{filename}.pdf",
+        )
+        page_size = landscape(A4) if len(headers) > 6 else A4
+        doc = SimpleDocTemplate(
+            filepath, pagesize=page_size,
+            leftMargin=36, rightMargin=36,
+            topMargin=50, bottomMargin=36,
+        )
+        styles = getSampleStyleSheet()
+        elements: List[Any] = []
+
+        title_style = ParagraphStyle(
+            "ReportTitle", parent=styles["Heading1"],
+            fontSize=16, spaceAfter=4, alignment=1,
+        )
+        elements.append(Paragraph(title, title_style))
+
+        if subtitle:
+            sub_style = ParagraphStyle(
+                "ReportSubtitle", parent=styles["Normal"],
+                fontSize=9, alignment=1, spaceAfter=10,
+                textColor=colors.HexColor("#555555"),
+            )
+            elements.append(Paragraph(subtitle, sub_style))
+
+        elements.append(Spacer(1, 8))
+
+        # Build table
+        table_data = [headers] + rows
+        num_cols = len(headers)
+        avail_width = (
+            page_size[0] - doc.leftMargin - doc.rightMargin
+        )
+        col_width = avail_width / num_cols
+        col_widths = [col_width] * num_cols
+
+        table = Table(table_data, colWidths=col_widths, repeatRows=1)
+        style_commands = [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 8),
+            ("FONTSIZE", (0, 1), (-1, -1), 7),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -2),
+             [colors.white, colors.HexColor("#f5f6fa")]),
+        ]
+        if rows:
+            style_commands.append(
+                ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold")
+            )
+            style_commands.append(
+                ("LINEABOVE", (0, -1), (-1, -1), 1, colors.black)
+            )
+        table.setStyle(TableStyle(style_commands))
+        elements.append(table)
+
+        # Footer with generation timestamp
+        elements.append(Spacer(1, 14))
+        footer_style = ParagraphStyle(
+            "ReportFooter", parent=styles["Normal"],
+            fontSize=7, textColor=colors.HexColor("#999999"),
+        )
+        elements.append(Paragraph(
+            f"Generated on "
+            f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            footer_style,
+        ))
+
+        try:
+            doc.build(elements)
+        except Exception as exc:
+            self._logger.error("PDF generation failed: %s", exc)
+            raise
+        self._logger.info("PDF report generated: %s", filepath)
+        return filepath
+
+    # ------------------------------------------------------------------
+    # Excel generation (openpyxl)
+    # ------------------------------------------------------------------
+
+    def _generate_excel(
+        self,
+        headers: List[str],
+        rows: List[list],
+        title: str,
+        filename: str,
+    ) -> str:
+        """Generate an Excel workbook using openpyxl.
+
+        Args:
+            headers: Column headers.
+            rows: Data rows.
+            title: Worksheet title (truncated to 31 chars for Excel).
+            filename: Base filename.
+
+        Returns:
+            Absolute path to the Excel file.
+        """
+        filepath = os.path.join(
+            tempfile.gettempdir(),
+            f"{self._REPORT_PREFIX}{filename}.xlsx",
+        )
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = title[:31]
+
+        # Header styling
+        header_font = Font(bold=True, color="FFFFFF", size=10)
+        header_fill = PatternFill(
+            start_color="2C3E50", end_color="2C3E50", fill_type="solid",
+        )
+        header_alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True,
+        )
+        thin_border = Border(
+            left=Side(style="thin"),
+            right=Side(style="thin"),
+            top=Side(style="thin"),
+            bottom=Side(style="thin"),
+        )
+
+        # Title row
+        ws.merge_cells(
+            start_row=1, start_column=1,
+            end_row=1, end_column=len(headers),
+        )
+        title_cell = ws.cell(row=1, column=1, value=title)
+        title_cell.font = Font(bold=True, size=14)
+        title_cell.alignment = Alignment(horizontal="center")
+
+        # Timestamp row
+        ws.merge_cells(
+            start_row=2, start_column=1,
+            end_row=2, end_column=len(headers),
+        )
+        ts_cell = ws.cell(
+            row=2, column=1,
+            value=f"Generated: "
+                  f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        )
+        ts_cell.font = Font(italic=True, size=8, color="999999")
+        ts_cell.alignment = Alignment(horizontal="center")
+
+        header_row = 4
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=header_row, column=col_idx, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
+            cell.border = thin_border
+
+        # Data rows
+        alt_fill = PatternFill(
+            start_color="F5F6FA", end_color="F5F6FA", fill_type="solid",
+        )
+        data_alignment = Alignment(horizontal="center", vertical="center")
+        for row_idx, row in enumerate(rows, header_row + 1):
+            for col_idx, value in enumerate(row, 1):
+                cell = ws.cell(row=row_idx, column=col_idx, value=value)
+                cell.border = thin_border
+                cell.alignment = data_alignment
+                if (row_idx - header_row) % 2 == 0:
+                    cell.fill = alt_fill
+
+        # Bold last row (totals)
+        if rows:
+            last_row = header_row + len(rows)
+            for col_idx in range(1, len(headers) + 1):
+                cell = ws.cell(row=last_row, column=col_idx)
+                cell.font = Font(bold=True, size=10)
+
+        # Auto-column widths
+        for col_idx in range(1, len(headers) + 1):
+            max_len = len(str(headers[col_idx - 1]))
+            for row in rows:
+                if col_idx - 1 < len(row):
+                    max_len = max(max_len, len(str(row[col_idx - 1])))
+            adjusted = min(max_len + 4, 50)
+            ws.column_dimensions[
+                get_column_letter(col_idx)
+            ].width = adjusted
+
+        # Freeze header
+        ws.freeze_panes = f"A{header_row + 1}"
+
+        try:
+            wb.save(filepath)
+        except Exception as exc:
+            self._logger.error("Excel generation failed: %s", exc)
+            raise
+        self._logger.info("Excel report generated: %s", filepath)
+        return filepath
+
+    # ------------------------------------------------------------------
+    # CSV fallback
+    # ------------------------------------------------------------------
+
+    def _generate_csv_fallback(
+        self,
+        headers: List[str],
+        rows: List[list],
+        filename: str,
+    ) -> str:
+        """Generate a CSV file as a universal fallback.
+
+        Args:
+            headers: Column headers.
+            rows: Data rows.
+            filename: Base filename.
+
+        Returns:
+            Absolute path to the CSV file.
+        """
+        filepath = os.path.join(
+            tempfile.gettempdir(),
+            f"{self._REPORT_PREFIX}{filename}.csv",
+        )
+        try:
+            with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(headers)
+                writer.writerows(rows)
+        except Exception as exc:
+            self._logger.error("CSV generation failed: %s", exc)
+            raise
+        self._logger.info("CSV report generated: %s", filepath)
+        return filepath
+
