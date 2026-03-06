@@ -4456,3 +4456,3670 @@ class NotificationService(BaseService):
             (user_id,)
         ) or 0
 
+
+# =============================================================================
+# SECTION 7: Business Engines
+# =============================================================================
+
+
+class GOSIEngine(BaseService):
+    """Engine for General Organization for Social Insurance (GOSI) calculations.
+
+    Handles employer and employee contribution calculations, GOSI base
+    determination, and periodic GOSI reporting for Saudi and non-Saudi
+    employees according to Saudi labor regulations.
+    """
+
+    def get_gosi_rates(self, is_saudi: bool) -> dict:
+        """Return the applicable GOSI contribution rates.
+
+        Args:
+            is_saudi: Whether the employee holds Saudi nationality.
+
+        Returns:
+            Dict with employer_rate, employee_rate, and salary ceiling.
+        """
+        if is_saudi:
+            return {
+                'employer_rate': GOSI_SAUDI_EMPLOYER_RATE,
+                'employee_rate': GOSI_SAUDI_EMPLOYEE_RATE,
+                'ceiling': GOSI_SALARY_CEILING,
+            }
+        return {
+            'employer_rate': GOSI_NON_SAUDI_EMPLOYER_RATE,
+            'employee_rate': GOSI_NON_SAUDI_EMPLOYEE_RATE,
+            'ceiling': GOSI_SALARY_CEILING,
+        }
+
+    def _compute_gosi_base(self, basic_salary: float,
+                           housing_allowance: float) -> float:
+        """Compute the GOSI-eligible base salary capped at the ceiling.
+
+        GOSI base is the sum of basic salary and housing allowance, but
+        must not exceed the regulatory ceiling.
+        """
+        raw = basic_salary + housing_allowance
+        return min(raw, GOSI_SALARY_CEILING)
+
+    def calculate_gosi(self, employee_id: int) -> dict:
+        """Calculate GOSI contributions for an employee by looking up their record.
+
+        Args:
+            employee_id: Primary key in the employees table.
+
+        Returns:
+            Dict containing gosi_base, employer_contribution,
+            employee_contribution, total, and rate metadata.
+
+        Raises:
+            ValueError: If the employee is not found.
+        """
+        employee = self.db.fetchone(
+            "SELECT id, emp_number, first_name, last_name, basic_salary, "
+            "housing_allowance, is_saudi, gosi_eligible FROM employees "
+            "WHERE id = ?",
+            (employee_id,),
+        )
+        if not employee:
+            raise ValueError(f"Employee {employee_id} not found")
+
+        return self.calculate_gosi_for_payroll(employee)
+
+    def calculate_gosi_for_payroll(self, employee_data: dict) -> dict:
+        """Calculate GOSI contributions from an already-loaded employee dict.
+
+        Expected keys: basic_salary, housing_allowance, is_saudi,
+        gosi_eligible (optional, defaults to True).
+
+        Returns:
+            Dict with gosi_base, employer_contribution,
+            employee_contribution, total_contribution, and rates.
+        """
+        gosi_eligible = employee_data.get('gosi_eligible', 1)
+        if not gosi_eligible:
+            return {
+                'gosi_base': 0.0,
+                'employer_contribution': 0.0,
+                'employee_contribution': 0.0,
+                'total_contribution': 0.0,
+                'employer_rate': 0.0,
+                'employee_rate': 0.0,
+                'is_saudi': bool(employee_data.get('is_saudi', 0)),
+                'is_eligible': False,
+            }
+
+        is_saudi = bool(employee_data.get('is_saudi', 0))
+        basic = float(employee_data.get('basic_salary', 0))
+        housing = float(employee_data.get('housing_allowance', 0))
+        rates = self.get_gosi_rates(is_saudi)
+        gosi_base = self._compute_gosi_base(basic, housing)
+
+        employer_contrib = round(gosi_base * rates['employer_rate'], 2)
+        employee_contrib = round(gosi_base * rates['employee_rate'], 2)
+
+        return {
+            'gosi_base': gosi_base,
+            'employer_contribution': employer_contrib,
+            'employee_contribution': employee_contrib,
+            'total_contribution': round(employer_contrib + employee_contrib, 2),
+            'employer_rate': rates['employer_rate'],
+            'employee_rate': rates['employee_rate'],
+            'is_saudi': is_saudi,
+            'is_eligible': True,
+        }
+
+    def generate_gosi_report(self, company_id: int, period: str) -> dict:
+        """Generate an aggregate GOSI report for a company and period.
+
+        Args:
+            company_id: The company to report on.
+            period: Period string in ``YYYY-MM`` format.
+
+        Returns:
+            Dict with period metadata, per-employee breakdowns, and totals.
+        """
+        try:
+            year, month = period.split('-')
+            year, month = int(year), int(month)
+        except (ValueError, AttributeError):
+            raise ValueError(f"Invalid period format '{period}', expected YYYY-MM")
+
+        employees = self.db.fetchall(
+            "SELECT id, emp_number, first_name, last_name, basic_salary, "
+            "housing_allowance, is_saudi, gosi_eligible FROM employees "
+            "WHERE company_id = ? AND is_active = 1 AND gosi_eligible = 1",
+            (company_id,),
+        )
+
+        details: List[dict] = []
+        total_employer = 0.0
+        total_employee = 0.0
+        saudi_count = 0
+        non_saudi_count = 0
+
+        for emp in employees:
+            calc = self.calculate_gosi_for_payroll(emp)
+            detail = {
+                'employee_id': emp['id'],
+                'emp_number': emp.get('emp_number', ''),
+                'name': f"{emp.get('first_name', '')} {emp.get('last_name', '')}".strip(),
+                'is_saudi': calc['is_saudi'],
+                **calc,
+            }
+            details.append(detail)
+            total_employer += calc['employer_contribution']
+            total_employee += calc['employee_contribution']
+            if calc['is_saudi']:
+                saudi_count += 1
+            else:
+                non_saudi_count += 1
+
+        return {
+            'company_id': company_id,
+            'period': period,
+            'year': year,
+            'month': month,
+            'total_employees': len(details),
+            'saudi_count': saudi_count,
+            'non_saudi_count': non_saudi_count,
+            'total_employer_contribution': round(total_employer, 2),
+            'total_employee_contribution': round(total_employee, 2),
+            'total_contribution': round(total_employer + total_employee, 2),
+            'details': details,
+            'generated_at': datetime.datetime.now().isoformat(),
+        }
+
+
+class EOSBEngine(BaseService):
+    """Engine for End-of-Service Benefits (EOSB) calculations.
+
+    Implements the Saudi Labor Law formula:
+    - First 5 years of service: half-month basic salary per year.
+    - Years beyond 5: full-month basic salary per year.
+    Partial years are pro-rated.
+    """
+
+    def _service_years(self, hire_date_str: str,
+                       termination_date_str: str = None) -> float:
+        """Return total years of service as a float (fractional years)."""
+        try:
+            hire = datetime.datetime.strptime(hire_date_str[:10], '%Y-%m-%d').date()
+        except (ValueError, TypeError):
+            raise ValueError(f"Invalid hire_date: {hire_date_str}")
+
+        if termination_date_str:
+            try:
+                end = datetime.datetime.strptime(
+                    termination_date_str[:10], '%Y-%m-%d'
+                ).date()
+            except (ValueError, TypeError):
+                end = datetime.date.today()
+        else:
+            end = datetime.date.today()
+
+        if end < hire:
+            return 0.0
+
+        delta = end - hire
+        return round(delta.days / 365.25, 4)
+
+    def _calculate_benefit(self, basic_salary: float,
+                           years_of_service: float) -> float:
+        """Core EOSB computation.
+
+        - First 5 years: 0.5 × monthly basic per year
+        - After 5 years: 1.0 × monthly basic per year
+        Partial years are pro-rated proportionally.
+        """
+        if years_of_service <= 0 or basic_salary <= 0:
+            return 0.0
+
+        half_month_salary = basic_salary / 2.0
+        full_month_salary = basic_salary
+
+        if years_of_service <= EOSB_HALF_MONTH_YEARS:
+            return round(half_month_salary * years_of_service, 2)
+
+        first_part = half_month_salary * EOSB_HALF_MONTH_YEARS
+        remaining_years = years_of_service - EOSB_HALF_MONTH_YEARS
+        second_part = full_month_salary * remaining_years
+        return round(first_part + second_part, 2)
+
+    def calculate_eosb(self, employee_id: int) -> dict:
+        """Calculate EOSB for an employee by ID.
+
+        Args:
+            employee_id: Primary key of the employee record.
+
+        Returns:
+            Dict with service details and computed benefit amount.
+
+        Raises:
+            ValueError: If the employee is not found.
+        """
+        employee = self.db.fetchone(
+            "SELECT id, emp_number, first_name, last_name, basic_salary, "
+            "hire_date, termination_date, is_active FROM employees WHERE id = ?",
+            (employee_id,),
+        )
+        if not employee:
+            raise ValueError(f"Employee {employee_id} not found")
+
+        return self.calculate_eosb_from_data(
+            basic_salary=float(employee.get('basic_salary', 0)),
+            hire_date=employee.get('hire_date', ''),
+            termination_date=employee.get('termination_date'),
+        )
+
+    def calculate_eosb_from_data(self, basic_salary: float,
+                                 hire_date: str,
+                                 termination_date: str = None) -> dict:
+        """Calculate EOSB from raw data without a database lookup.
+
+        Args:
+            basic_salary: Monthly basic salary.
+            hire_date: ISO date string of the hire date.
+            termination_date: Optional ISO date string; defaults to today.
+
+        Returns:
+            Dict with years_of_service, basic_salary, and eosb_amount.
+        """
+        years = self._service_years(hire_date, termination_date)
+        benefit = self._calculate_benefit(basic_salary, years)
+
+        end_date = termination_date if termination_date else datetime.date.today().isoformat()
+
+        return {
+            'hire_date': hire_date,
+            'end_date': end_date,
+            'years_of_service': round(years, 2),
+            'basic_salary': basic_salary,
+            'half_month_years': min(years, EOSB_HALF_MONTH_YEARS),
+            'full_month_years': max(0, round(years - EOSB_FULL_MONTH_START, 2)),
+            'eosb_amount': benefit,
+        }
+
+    def generate_eosb_report(self, company_id: int) -> dict:
+        """Generate a company-wide EOSB liability report.
+
+        Calculates the current EOSB provision for every active employee,
+        useful for financial reporting and accrual accounting.
+
+        Args:
+            company_id: The company to report on.
+
+        Returns:
+            Dict with total_liability, employee count, and per-employee details.
+        """
+        employees = self.db.fetchall(
+            "SELECT id, emp_number, first_name, last_name, basic_salary, "
+            "hire_date, termination_date, is_active FROM employees "
+            "WHERE company_id = ? AND is_active = 1",
+            (company_id,),
+        )
+
+        details: List[dict] = []
+        total_liability = 0.0
+
+        for emp in employees:
+            try:
+                calc = self.calculate_eosb_from_data(
+                    basic_salary=float(emp.get('basic_salary', 0)),
+                    hire_date=emp.get('hire_date', ''),
+                    termination_date=emp.get('termination_date'),
+                )
+                detail = {
+                    'employee_id': emp['id'],
+                    'emp_number': emp.get('emp_number', ''),
+                    'name': f"{emp.get('first_name', '')} {emp.get('last_name', '')}".strip(),
+                    **calc,
+                }
+                details.append(detail)
+                total_liability += calc['eosb_amount']
+            except Exception as exc:
+                self._logger.warning(
+                    "Failed to calculate EOSB for employee %s: %s",
+                    emp.get('id'), exc,
+                )
+
+        return {
+            'company_id': company_id,
+            'total_employees': len(details),
+            'total_liability': round(total_liability, 2),
+            'details': details,
+            'generated_at': datetime.datetime.now().isoformat(),
+        }
+
+
+class WPSEngine(BaseService):
+    """Engine for Wage Protection System (WPS) SIF file generation.
+
+    The SIF (Salary Information File) format is used by Saudi banks to
+    process payroll transfers in compliance with the Ministry of Human
+    Resources' Wage Protection System.
+    """
+
+    # SIF record type constants
+    RECORD_TYPE_HEADER = 'HDR'
+    RECORD_TYPE_DETAIL = 'DTL'
+    RECORD_TYPE_TRAILER = 'TRL'
+    PAYMENT_TYPE_SALARY = 'SAL'
+
+    def _pad_right(self, value: str, length: int) -> str:
+        """Pad a string with spaces on the right to the given length."""
+        return str(value)[:length].ljust(length)
+
+    def _pad_left_zero(self, value: Union[int, float, str], length: int) -> str:
+        """Pad a numeric value with leading zeros to the given length."""
+        s = str(int(value))
+        if len(s) > length:
+            self._logger.warning(
+                "Value %s exceeds %d digits; truncating", value, length,
+            )
+        return s.zfill(length)[-length:]
+
+    def _format_amount(self, amount: float) -> str:
+        """Format a monetary amount as a 15-character zero-padded string (2 decimal implied)."""
+        cents = int(round(amount * 100))
+        return str(max(cents, 0)).zfill(15)
+
+    def format_sif_record(self, entry: dict) -> str:
+        """Format a single payroll entry into a SIF detail record line.
+
+        Args:
+            entry: Dict with employee_id, emp_number, bank_iban,
+                   bank_account, net_salary, basic_salary,
+                   housing_allowance, other_allowances, total_deductions.
+
+        Returns:
+            Fixed-width string representing one SIF detail line.
+        """
+        parts = [
+            self.RECORD_TYPE_DETAIL,
+            self._pad_right(str(entry.get('emp_number', '')), 15),
+            self._pad_right(str(entry.get('bank_iban', '')), 24),
+            self._pad_right(str(entry.get('bank_account', '')), 20),
+            self._format_amount(float(entry.get('net_salary', 0))),
+            self._format_amount(float(entry.get('basic_salary', 0))),
+            self._format_amount(float(entry.get('housing_allowance', 0))),
+            self._format_amount(float(entry.get('other_allowances', 0))),
+            self._format_amount(float(entry.get('total_deductions', 0))),
+            self._pad_right(self.PAYMENT_TYPE_SALARY, 3),
+        ]
+        return '|'.join(parts)
+
+    def validate_sif_data(self, payroll_entries: List[dict]) -> dict:
+        """Validate payroll entries before SIF generation.
+
+        Checks for missing IBANs, negative amounts, and other data
+        integrity issues.
+
+        Args:
+            payroll_entries: List of payroll entry dicts.
+
+        Returns:
+            Dict with is_valid flag, error list, and warning list.
+        """
+        errors: List[str] = []
+        warnings: List[str] = []
+
+        if not payroll_entries:
+            errors.append("No payroll entries provided")
+            return {'is_valid': False, 'errors': errors, 'warnings': warnings}
+
+        for idx, entry in enumerate(payroll_entries):
+            emp_ref = entry.get('emp_number', entry.get('employee_id', f'row-{idx}'))
+
+            iban = str(entry.get('bank_iban', '') or '')
+            if not iban:
+                errors.append(f"Employee {emp_ref}: missing bank IBAN")
+            elif not iban.startswith('SA') or len(iban) != 24:
+                warnings.append(f"Employee {emp_ref}: IBAN '{iban}' may be invalid")
+
+            net = float(entry.get('net_salary', 0))
+            if net <= 0:
+                errors.append(f"Employee {emp_ref}: net salary is {net}")
+
+            basic = float(entry.get('basic_salary', 0))
+            if basic <= 0:
+                warnings.append(f"Employee {emp_ref}: basic salary is {basic}")
+
+        return {
+            'is_valid': len(errors) == 0,
+            'errors': errors,
+            'warnings': warnings,
+            'total_records': len(payroll_entries),
+        }
+
+    def generate_sif_file(self, payroll_run_id: int) -> str:
+        """Generate a complete SIF file for a payroll run.
+
+        Fetches entries from the database, validates them, and produces a
+        multi-line SIF string including header, detail records, and trailer.
+
+        Args:
+            payroll_run_id: The ID of the payroll run.
+
+        Returns:
+            The full SIF file content as a string.
+
+        Raises:
+            ValueError: If the payroll run is not found or has no entries.
+        """
+        run = self.db.fetchone(
+            "SELECT pr.id, pr.period_id, pr.run_number, pr.status, "
+            "pp.company_id, pp.period_year, pp.period_month "
+            "FROM payroll_runs pr "
+            "JOIN payroll_periods pp ON pr.period_id = pp.id "
+            "WHERE pr.id = ?",
+            (payroll_run_id,),
+        )
+        if not run:
+            raise ValueError(f"Payroll run {payroll_run_id} not found")
+
+        entries = self.db.fetchall(
+            "SELECT pe.*, e.emp_number, e.bank_name, e.bank_account, "
+            "e.bank_iban, e.first_name, e.last_name "
+            "FROM payroll_entries pe "
+            "JOIN employees e ON pe.employee_id = e.id "
+            "WHERE pe.payroll_run_id = ?",
+            (payroll_run_id,),
+        )
+        if not entries:
+            raise ValueError(f"No payroll entries found for run {payroll_run_id}")
+
+        validation = self.validate_sif_data(entries)
+        if not validation['is_valid']:
+            self._logger.error("SIF validation failed: %s", validation['errors'])
+            raise ValueError(
+                f"SIF validation failed with {len(validation['errors'])} error(s): "
+                + "; ".join(validation['errors'][:5])
+            )
+
+        company = self.db.fetchone(
+            "SELECT name, commercial_registration FROM companies WHERE id = ?",
+            (run.get('company_id'),),
+        )
+
+        now = datetime.datetime.now()
+        file_ref = f"SIF{run.get('company_id', 0):04d}{now.strftime('%Y%m%d%H%M%S')}"
+
+        # Header
+        header_parts = [
+            self.RECORD_TYPE_HEADER,
+            self._pad_right(file_ref, 20),
+            self._pad_right(str(company.get('name', '') if company else ''), 40),
+            self._pad_right(
+                str(company.get('commercial_registration', '') if company else ''), 15
+            ),
+            now.strftime('%Y%m%d'),
+            now.strftime('%H%M%S'),
+            self._pad_left_zero(len(entries), 6),
+        ]
+        header = '|'.join(header_parts)
+
+        # Detail records
+        detail_lines = [self.format_sif_record(e) for e in entries]
+
+        # Trailer
+        total_net = sum(float(e.get('net_salary', 0)) for e in entries)
+        trailer_parts = [
+            self.RECORD_TYPE_TRAILER,
+            self._pad_left_zero(len(entries), 6),
+            self._format_amount(total_net),
+        ]
+        trailer = '|'.join(trailer_parts)
+
+        lines = [header] + detail_lines + [trailer]
+        sif_content = '\n'.join(lines)
+
+        self._logger.info(
+            "Generated SIF file for run %s with %d records, total %.2f",
+            payroll_run_id, len(entries), total_net,
+        )
+        return sif_content
+
+
+class ZATCAEngine(BaseService):
+    """Engine for ZATCA (Zakat, Tax and Customs Authority) e-invoicing.
+
+    Implements TLV (Tag-Length-Value) encoding for generating ZATCA-compliant
+    QR codes on electronic invoices as required by Saudi e-invoicing
+    regulations (Fatoora).
+    """
+
+    # TLV tag assignments per ZATCA specification
+    TAG_SELLER_NAME = 1
+    TAG_VAT_NUMBER = 2
+    TAG_TIMESTAMP = 3
+    TAG_TOTAL_WITH_VAT = 4
+    TAG_VAT_TOTAL = 5
+
+    def encode_tlv(self, tag: int, value: str) -> bytes:
+        """Encode a single TLV (Tag-Length-Value) element.
+
+        Args:
+            tag: Integer tag identifier (1-5 for ZATCA Phase 1).
+            value: The string value to encode.
+
+        Returns:
+            Bytes representing the TLV-encoded element.
+        """
+        value_bytes = str(value).encode('utf-8')
+        length = len(value_bytes)
+        return bytes([tag, length]) + value_bytes
+
+    def generate_qr_data(self, seller_name: str, vat_number: str,
+                         timestamp: str, total: float,
+                         vat_total: float) -> str:
+        """Generate a ZATCA-compliant QR code data string (base64).
+
+        Encodes the five mandatory TLV fields and returns the result as
+        a base64-encoded string suitable for embedding in a QR code.
+
+        Args:
+            seller_name: The seller/company name.
+            vat_number: VAT registration number.
+            timestamp: ISO-8601 formatted timestamp of the invoice.
+            total: Invoice total amount including VAT.
+            vat_total: Total VAT amount.
+
+        Returns:
+            Base64-encoded string of the concatenated TLV data.
+        """
+        tlv_data = b''
+        tlv_data += self.encode_tlv(self.TAG_SELLER_NAME, seller_name)
+        tlv_data += self.encode_tlv(self.TAG_VAT_NUMBER, vat_number)
+        tlv_data += self.encode_tlv(self.TAG_TIMESTAMP, timestamp)
+        tlv_data += self.encode_tlv(self.TAG_TOTAL_WITH_VAT, f"{total:.2f}")
+        tlv_data += self.encode_tlv(self.TAG_VAT_TOTAL, f"{vat_total:.2f}")
+        return base64.b64encode(tlv_data).decode('ascii')
+
+    def generate_invoice_qr(self, invoice_id: int) -> str:
+        """Generate a QR code data string for a persisted invoice.
+
+        Looks up the invoice and its associated company, then delegates
+        to :meth:`generate_qr_data`.
+
+        Args:
+            invoice_id: Primary key of the invoice.
+
+        Returns:
+            Base64-encoded QR string.
+
+        Raises:
+            ValueError: If the invoice or company is not found.
+        """
+        invoice = self.db.fetchone(
+            "SELECT id, company_id, invoice_number, invoice_date, "
+            "total_amount, vat_amount FROM invoices WHERE id = ?",
+            (invoice_id,),
+        )
+        if not invoice:
+            raise ValueError(f"Invoice {invoice_id} not found")
+
+        company = self.db.fetchone(
+            "SELECT name, vat_number FROM companies WHERE id = ?",
+            (invoice.get('company_id'),),
+        )
+        if not company:
+            raise ValueError(
+                f"Company {invoice.get('company_id')} not found for invoice {invoice_id}"
+            )
+
+        return self.generate_qr_data(
+            seller_name=company.get('name', ''),
+            vat_number=company.get('vat_number', ''),
+            timestamp=invoice.get('invoice_date', datetime.datetime.now().isoformat()),
+            total=float(invoice.get('total_amount', 0)),
+            vat_total=float(invoice.get('vat_amount', 0)),
+        )
+
+    def generate_qr_code(self, invoice: dict) -> str:
+        """Generate a ZATCA QR string from an invoice dict.
+
+        This is the primary method used by ``InvoiceService`` when creating
+        or updating invoices. It expects the invoice dict to carry either
+        direct seller/VAT fields or a nested ``company`` dict.
+
+        Args:
+            invoice: Dict with invoice data. Recognised keys include
+                seller_name / company.name, vat_number / company.vat_number,
+                invoice_date, total_amount, and vat_amount.
+
+        Returns:
+            Base64-encoded QR data string, or empty string on failure.
+        """
+        try:
+            company_data = invoice.get('company', {})
+            seller_name = (
+                invoice.get('seller_name')
+                or company_data.get('name', '')
+            )
+            vat_number = (
+                invoice.get('vat_number')
+                or company_data.get('vat_number', '')
+            )
+            timestamp = invoice.get(
+                'invoice_date', datetime.datetime.now().isoformat()
+            )
+            total = float(invoice.get('total_amount', 0))
+            vat_total = float(invoice.get('vat_amount', 0))
+
+            return self.generate_qr_data(
+                seller_name=seller_name,
+                vat_number=vat_number,
+                timestamp=timestamp,
+                total=total,
+                vat_total=vat_total,
+            )
+        except Exception as exc:
+            self._logger.error("Failed to generate QR code: %s", exc)
+            return ''
+
+    def validate_qr(self, qr_base64: str) -> dict:
+        """Decode and validate a ZATCA QR base64 string.
+
+        Parses the TLV-encoded data and checks that all five mandatory
+        fields are present.
+
+        Args:
+            qr_base64: Base64-encoded QR data string.
+
+        Returns:
+            Dict with is_valid flag, decoded fields, and any errors.
+        """
+        result: Dict[str, Any] = {
+            'is_valid': False,
+            'fields': {},
+            'errors': [],
+        }
+
+        if not qr_base64:
+            result['errors'].append("Empty QR data")
+            return result
+
+        try:
+            raw = base64.b64decode(qr_base64)
+        except Exception:
+            result['errors'].append("Invalid base64 encoding")
+            return result
+
+        tag_names = {
+            self.TAG_SELLER_NAME: 'seller_name',
+            self.TAG_VAT_NUMBER: 'vat_number',
+            self.TAG_TIMESTAMP: 'timestamp',
+            self.TAG_TOTAL_WITH_VAT: 'total_with_vat',
+            self.TAG_VAT_TOTAL: 'vat_total',
+        }
+
+        offset = 0
+        while offset < len(raw):
+            if offset + 2 > len(raw):
+                result['errors'].append("Truncated TLV data")
+                break
+            tag = raw[offset]
+            length = raw[offset + 1]
+            offset += 2
+
+            if offset + length > len(raw):
+                result['errors'].append(f"TLV tag {tag}: declared length exceeds data")
+                break
+
+            value = raw[offset:offset + length].decode('utf-8', errors='replace')
+            offset += length
+
+            field_name = tag_names.get(tag, f'unknown_tag_{tag}')
+            result['fields'][field_name] = value
+
+        required = set(tag_names.values())
+        found = set(result['fields'].keys())
+        missing = required - found
+        if missing:
+            result['errors'].append(f"Missing required fields: {', '.join(sorted(missing))}")
+
+        result['is_valid'] = len(result['errors']) == 0
+        return result
+
+
+class PayrollEngine(BaseService):
+    """Comprehensive payroll processing engine.
+
+    Orchestrates the full payroll lifecycle: creating runs, calculating
+    gross and net salaries, applying GOSI contributions and deductions,
+    and finalising payroll for posting.
+    """
+
+    def __init__(self, db: 'DatabaseManager'):
+        super().__init__(db)
+        self.gosi_engine = GOSIEngine(db)
+
+    # ------------------------------------------------------------------
+    # Run lifecycle
+    # ------------------------------------------------------------------
+
+    def create_payroll_run(self, company_id: int, period_id: int,
+                           run_by: int = None) -> int:
+        """Create a new payroll run record.
+
+        Args:
+            company_id: Company to run payroll for.
+            period_id: The payroll period to process.
+            run_by: User ID who initiated the run (optional).
+
+        Returns:
+            The new payroll_run ID.
+
+        Raises:
+            ValueError: If the period is not found or already processed.
+        """
+        period = self.db.fetchone(
+            "SELECT id, company_id, period_year, period_month, status "
+            "FROM payroll_periods WHERE id = ? AND company_id = ?",
+            (period_id, company_id),
+        )
+        if not period:
+            raise ValueError(f"Payroll period {period_id} not found for company {company_id}")
+
+        if period.get('status') == 'posted':
+            raise ValueError(f"Payroll period {period_id} is already posted")
+
+        existing_count = self.db.fetchscalar(
+            "SELECT COUNT(*) FROM payroll_runs WHERE period_id = ?",
+            (period_id,),
+        ) or 0
+
+        run_id = self.db.insert('payroll_runs', {
+            'period_id': period_id,
+            'run_number': existing_count + 1,
+            'run_type': 'regular',
+            'status': 'draft',
+            'total_employees': 0,
+            'total_gross': 0,
+            'total_net': 0,
+            'run_by': run_by,
+            'run_at': datetime.datetime.now().isoformat(),
+            'notes': '',
+        })
+        self._logger.info("Created payroll run %s for period %s", run_id, period_id)
+        return run_id
+
+    def process_payroll(self, run_id: int) -> dict:
+        """Process payroll for all active employees in the run's company.
+
+        Calculates salaries, GOSI, and deductions for each employee, then
+        persists the results to ``payroll_entries``.
+
+        Args:
+            run_id: The payroll run to process.
+
+        Returns:
+            Summary dict with counts and totals.
+        """
+        run = self.db.fetchone(
+            "SELECT pr.id, pr.period_id, pr.status, pp.company_id, "
+            "pp.period_year, pp.period_month, pp.start_date, pp.end_date "
+            "FROM payroll_runs pr "
+            "JOIN payroll_periods pp ON pr.period_id = pp.id "
+            "WHERE pr.id = ?",
+            (run_id,),
+        )
+        if not run:
+            raise ValueError(f"Payroll run {run_id} not found")
+
+        if run.get('status') not in ('draft', 'processing'):
+            raise ValueError(f"Payroll run {run_id} cannot be processed (status: {run['status']})")
+
+        self.db.execute(
+            "UPDATE payroll_runs SET status = 'processing' WHERE id = ?",
+            (run_id,),
+        )
+
+        employees = self.db.fetchall(
+            "SELECT * FROM employees WHERE company_id = ? AND is_active = 1",
+            (run['company_id'],),
+        )
+
+        period_data = {
+            'period_id': run['period_id'],
+            'period_year': run.get('period_year'),
+            'period_month': run.get('period_month'),
+            'start_date': run.get('start_date'),
+            'end_date': run.get('end_date'),
+        }
+
+        processed = 0
+        total_gross = 0.0
+        total_net = 0.0
+        errors: List[str] = []
+
+        for emp in employees:
+            try:
+                entry = self.calculate_employee_payroll(emp, period_data)
+                entry['payroll_run_id'] = run_id
+                entry['employee_id'] = emp['id']
+                entry['period_id'] = period_data['period_id']
+                entry['period_year'] = period_data.get('period_year')
+                entry['period_month'] = period_data.get('period_month')
+                entry['status'] = 'calculated'
+
+                self.db.insert('payroll_entries', entry)
+                processed += 1
+                total_gross += entry.get('gross_salary', 0)
+                total_net += entry.get('net_salary', 0)
+            except Exception as exc:
+                self._logger.error(
+                    "Payroll error for employee %s: %s", emp.get('id'), exc,
+                )
+                errors.append(f"Employee {emp.get('emp_number', emp['id'])}: {exc}")
+
+        new_status = 'calculated' if not errors else 'partial'
+        self.db.execute(
+            "UPDATE payroll_runs SET status = ?, total_employees = ?, "
+            "total_gross = ?, total_net = ? WHERE id = ?",
+            (new_status, processed, round(total_gross, 2),
+             round(total_net, 2), run_id),
+        )
+
+        return {
+            'run_id': run_id,
+            'status': new_status,
+            'total_employees': processed,
+            'total_gross': round(total_gross, 2),
+            'total_net': round(total_net, 2),
+            'errors': errors,
+        }
+
+    # ------------------------------------------------------------------
+    # Per-employee calculations
+    # ------------------------------------------------------------------
+
+    def calculate_gross_salary(self, employee: dict) -> float:
+        """Sum all salary components to obtain the gross salary.
+
+        Args:
+            employee: Dict with basic_salary, housing_allowance,
+                transport_allowance, food_allowance, other_allowances.
+
+        Returns:
+            The gross salary as a float.
+        """
+        components = [
+            float(employee.get('basic_salary', 0)),
+            float(employee.get('housing_allowance', 0)),
+            float(employee.get('transport_allowance', 0)),
+            float(employee.get('food_allowance', 0)),
+            float(employee.get('other_allowances', 0)),
+        ]
+        return round(sum(components), 2)
+
+    def calculate_employee_payroll(self, employee: dict,
+                                   period_data: dict) -> dict:
+        """Calculate payroll for a single employee.
+
+        Computes gross salary, GOSI contributions, and deductions to
+        arrive at the net salary.
+
+        Args:
+            employee: Employee record dict from the database.
+            period_data: Period metadata (period_id, year, month, dates).
+
+        Returns:
+            Dict of all payroll entry fields ready for insertion.
+        """
+        basic = float(employee.get('basic_salary', 0))
+        housing = float(employee.get('housing_allowance', 0))
+        transport = float(employee.get('transport_allowance', 0))
+        food = float(employee.get('food_allowance', 0))
+        other = float(employee.get('other_allowances', 0))
+        gross = self.calculate_gross_salary(employee)
+
+        gosi = self.gosi_engine.calculate_gosi_for_payroll(employee)
+
+        entry_data = {
+            'basic_salary': basic,
+            'housing_allowance': housing,
+            'transport_allowance': transport,
+            'food_allowance': food,
+            'other_allowances': other,
+            'overtime_amount': 0.0,
+            'bonus_amount': 0.0,
+            'gross_salary': gross,
+            'gosi_employee': gosi.get('employee_contribution', 0),
+            'gosi_employer': gosi.get('employer_contribution', 0),
+            'gosi_base': gosi.get('gosi_base', 0),
+            'working_days': 30,
+            'actual_days': 30,
+            'payment_method': 'bank_transfer',
+            'bank_iban': employee.get('bank_iban', ''),
+        }
+
+        entry_data = self.apply_deductions(entry_data, employee)
+        return entry_data
+
+    def apply_deductions(self, entry_data: dict, employee: dict) -> dict:
+        """Apply loan, advance, absence, and other deductions.
+
+        Queries outstanding loans and advances from the database, then
+        calculates the total deductions and net salary.
+
+        Args:
+            entry_data: The in-progress payroll entry dict.
+            employee: The employee record dict.
+
+        Returns:
+            Updated entry_data with deduction fields and net_salary.
+        """
+        employee_id = employee.get('id')
+        loan_deduction = 0.0
+        advance_deduction = 0.0
+
+        if employee_id:
+            active_loans = self.db.fetchall(
+                "SELECT id, installment_amount, outstanding_amount "
+                "FROM employee_loans "
+                "WHERE employee_id = ? AND status = 'active' "
+                "AND outstanding_amount > 0",
+                (employee_id,),
+            )
+            for loan in active_loans:
+                installment = float(loan.get('installment_amount', 0))
+                outstanding = float(loan.get('outstanding_amount', 0))
+                amount = min(installment, outstanding)
+                loan_deduction += amount
+
+        entry_data['loan_deduction'] = round(loan_deduction, 2)
+        entry_data['advance_deduction'] = round(advance_deduction, 2)
+        entry_data['absence_deduction'] = 0.0
+        entry_data['other_deductions'] = 0.0
+
+        total_deductions = (
+            entry_data.get('gosi_employee', 0)
+            + entry_data['loan_deduction']
+            + entry_data['advance_deduction']
+            + entry_data['absence_deduction']
+            + entry_data['other_deductions']
+        )
+        entry_data['total_deductions'] = round(total_deductions, 2)
+        entry_data['net_salary'] = round(
+            entry_data.get('gross_salary', 0) - total_deductions, 2
+        )
+
+        return entry_data
+
+    # ------------------------------------------------------------------
+    # Finalisation & reporting
+    # ------------------------------------------------------------------
+
+    def finalize_payroll_run(self, run_id: int) -> bool:
+        """Finalise a payroll run, marking it ready for posting.
+
+        Updates the run status and locks all associated entries.
+
+        Args:
+            run_id: The payroll run to finalise.
+
+        Returns:
+            True if finalisation succeeded.
+
+        Raises:
+            ValueError: If the run is in an invalid state.
+        """
+        run = self.db.fetchone(
+            "SELECT id, status FROM payroll_runs WHERE id = ?", (run_id,),
+        )
+        if not run:
+            raise ValueError(f"Payroll run {run_id} not found")
+
+        if run.get('status') not in ('calculated', 'partial'):
+            raise ValueError(
+                f"Payroll run {run_id} cannot be finalised (status: {run['status']})"
+            )
+
+        with self.db.transaction():
+            self.db.execute(
+                "UPDATE payroll_runs SET status = 'finalized', "
+                "posted_at = ? WHERE id = ?",
+                (datetime.datetime.now().isoformat(), run_id),
+            )
+            self.db.execute(
+                "UPDATE payroll_entries SET status = 'finalized' "
+                "WHERE payroll_run_id = ? AND status = 'calculated'",
+                (run_id,),
+            )
+
+            # Deduct loan installments from outstanding balances
+            entries = self.db.fetchall(
+                "SELECT employee_id, loan_deduction FROM payroll_entries "
+                "WHERE payroll_run_id = ? AND loan_deduction > 0",
+                (run_id,),
+            )
+            for entry in entries:
+                if entry['loan_deduction'] > 0:
+                    self.db.execute(
+                        "UPDATE employee_loans SET outstanding_amount = "
+                        "MAX(outstanding_amount - ?, 0) "
+                        "WHERE employee_id = ? AND status = 'active'",
+                        (entry['loan_deduction'], entry['employee_id']),
+                    )
+
+        self._logger.info("Finalised payroll run %s", run_id)
+        return True
+
+    def get_payroll_summary(self, run_id: int) -> dict:
+        """Retrieve a summary of a payroll run including aggregated figures.
+
+        Args:
+            run_id: The payroll run to summarise.
+
+        Returns:
+            Dict with run metadata, totals, and per-entry details.
+
+        Raises:
+            ValueError: If the run is not found.
+        """
+        run = self.db.fetchone(
+            "SELECT pr.*, pp.period_year, pp.period_month, pp.period_name "
+            "FROM payroll_runs pr "
+            "JOIN payroll_periods pp ON pr.period_id = pp.id "
+            "WHERE pr.id = ?",
+            (run_id,),
+        )
+        if not run:
+            raise ValueError(f"Payroll run {run_id} not found")
+
+        entries = self.db.fetchall(
+            "SELECT pe.*, e.emp_number, e.first_name, e.last_name, e.is_saudi "
+            "FROM payroll_entries pe "
+            "JOIN employees e ON pe.employee_id = e.id "
+            "WHERE pe.payroll_run_id = ?",
+            (run_id,),
+        )
+
+        total_basic = sum(float(e.get('basic_salary', 0)) for e in entries)
+        total_gross = sum(float(e.get('gross_salary', 0)) for e in entries)
+        total_gosi_ee = sum(float(e.get('gosi_employee', 0)) for e in entries)
+        total_gosi_er = sum(float(e.get('gosi_employer', 0)) for e in entries)
+        total_deductions = sum(float(e.get('total_deductions', 0)) for e in entries)
+        total_net = sum(float(e.get('net_salary', 0)) for e in entries)
+
+        return {
+            'run_id': run_id,
+            'period_name': run.get('period_name', ''),
+            'period_year': run.get('period_year'),
+            'period_month': run.get('period_month'),
+            'status': run.get('status'),
+            'run_at': run.get('run_at'),
+            'total_employees': len(entries),
+            'total_basic': round(total_basic, 2),
+            'total_gross': round(total_gross, 2),
+            'total_gosi_employee': round(total_gosi_ee, 2),
+            'total_gosi_employer': round(total_gosi_er, 2),
+            'total_deductions': round(total_deductions, 2),
+            'total_net': round(total_net, 2),
+            'entries': entries,
+        }
+
+
+class SecurityManager:
+    """Authentication and authorisation manager.
+
+    Handles password hashing (bcrypt preferred, SHA-256 fallback), session
+    management, and role-based access control. This class does **not**
+    extend ``BaseService``; it takes a ``DatabaseManager`` directly.
+    """
+
+    SESSION_EXPIRY_HOURS = 24
+
+    def __init__(self, db: 'DatabaseManager'):
+        self.db = db
+        self._logger = logging.getLogger('security.SecurityManager')
+
+    # ------------------------------------------------------------------
+    # Password hashing
+    # ------------------------------------------------------------------
+
+    def hash_password(self, password: str) -> str:
+        """Hash a plaintext password.
+
+        Uses bcrypt when available, otherwise falls back to salted SHA-256.
+
+        Args:
+            password: The plaintext password to hash.
+
+        Returns:
+            The hashed password string.
+        """
+        if not password:
+            raise ValueError("Password cannot be empty")
+
+        if HAS_BCRYPT:
+            try:
+                import bcrypt as _bcrypt
+                hashed = _bcrypt.hashpw(
+                    password.encode('utf-8'), _bcrypt.gensalt()
+                )
+                return hashed.decode('utf-8')
+            except Exception as exc:
+                self._logger.warning("bcrypt hashing failed, using fallback: %s", exc)
+
+        salt = uuid.uuid4().hex
+        hashed = hashlib.sha256((salt + password).encode('utf-8')).hexdigest()
+        return f"sha256${salt}${hashed}"
+
+    def verify_password(self, password: str, hashed: str) -> bool:
+        """Verify a plaintext password against a stored hash.
+
+        Supports both bcrypt and the sha256$salt$hash fallback format.
+
+        Args:
+            password: Plaintext password to verify.
+            hashed: Stored hash to compare against.
+
+        Returns:
+            True if the password matches.
+        """
+        if not password or not hashed:
+            return False
+
+        if hashed.startswith('sha256$'):
+            parts = hashed.split('$', 2)
+            if len(parts) != 3:
+                return False
+            _, salt, stored_hash = parts
+            check = hashlib.sha256((salt + password).encode('utf-8')).hexdigest()
+            return check == stored_hash
+
+        if HAS_BCRYPT:
+            try:
+                import bcrypt as _bcrypt
+                return _bcrypt.checkpw(
+                    password.encode('utf-8'), hashed.encode('utf-8')
+                )
+            except Exception:
+                return False
+
+        return False
+
+    # ------------------------------------------------------------------
+    # Session management
+    # ------------------------------------------------------------------
+
+    def create_session(self, user_id: int) -> str:
+        """Create a new authenticated session for a user.
+
+        Generates a cryptographically random session token and stores it
+        in the database with an expiry time.
+
+        Args:
+            user_id: The user to create a session for.
+
+        Returns:
+            The session token string.
+        """
+        token = uuid.uuid4().hex + uuid.uuid4().hex
+        now = datetime.datetime.now()
+        expires = now + datetime.timedelta(hours=self.SESSION_EXPIRY_HOURS)
+
+        self.db.insert('user_sessions', {
+            'user_id': user_id,
+            'session_token': token,
+            'created_at': now.isoformat(),
+            'expires_at': expires.isoformat(),
+            'is_active': 1,
+        })
+        self._logger.info("Created session for user %s", user_id)
+        return token
+
+    def validate_session(self, token: str) -> Optional[dict]:
+        """Validate a session token and return the associated user.
+
+        Checks the token exists, is active, and has not expired.
+
+        Args:
+            token: The session token to validate.
+
+        Returns:
+            User dict if valid, None otherwise.
+        """
+        if not token:
+            return None
+
+        session = self.db.fetchone(
+            "SELECT us.*, u.username, u.email, u.full_name, u.company_id, "
+            "u.is_admin FROM user_sessions us "
+            "JOIN users u ON us.user_id = u.id "
+            "WHERE us.session_token = ? AND us.is_active = 1",
+            (token,),
+        )
+        if not session:
+            return None
+
+        expires_at = session.get('expires_at', '')
+        try:
+            expires = datetime.datetime.fromisoformat(expires_at)
+            if datetime.datetime.now() > expires:
+                self.db.execute(
+                    "UPDATE user_sessions SET is_active = 0 WHERE session_token = ?",
+                    (token,),
+                )
+                return None
+        except (ValueError, TypeError):
+            return None
+
+        return {
+            'user_id': session.get('user_id'),
+            'username': session.get('username'),
+            'email': session.get('email'),
+            'full_name': session.get('full_name'),
+            'company_id': session.get('company_id'),
+            'is_admin': bool(session.get('is_admin', 0)),
+            'session_token': token,
+            'expires_at': expires_at,
+        }
+
+    def invalidate_session(self, token: str) -> bool:
+        """Invalidate (log out) a session.
+
+        Args:
+            token: The session token to invalidate.
+
+        Returns:
+            True if a session was found and invalidated.
+        """
+        rows = self.db.execute(
+            "UPDATE user_sessions SET is_active = 0 WHERE session_token = ? AND is_active = 1",
+            (token,),
+        )
+        return getattr(rows, 'rowcount', 0) > 0
+
+    # ------------------------------------------------------------------
+    # Role-based access control
+    # ------------------------------------------------------------------
+
+    def check_permission(self, user_id: int, permission: str) -> bool:
+        """Check whether a user has a specific permission.
+
+        Looks through all roles assigned to the user and checks if any
+        of them grant the requested permission code.
+
+        Args:
+            user_id: The user to check.
+            permission: The permission code string (e.g., ``payroll.run``).
+
+        Returns:
+            True if the user has the permission.
+        """
+        user = self.db.fetchone(
+            "SELECT id, is_admin FROM users WHERE id = ? AND is_active = 1",
+            (user_id,),
+        )
+        if not user:
+            return False
+
+        if user.get('is_admin'):
+            return True
+
+        count = self.db.fetchscalar(
+            "SELECT COUNT(*) FROM user_roles ur "
+            "JOIN role_permissions rp ON ur.role_id = rp.role_id "
+            "JOIN permissions p ON rp.permission_id = p.id "
+            "WHERE ur.user_id = ? AND p.code = ?",
+            (user_id, permission),
+        )
+        return (count or 0) > 0
+
+    def assign_role(self, user_id: int, role_id: int) -> bool:
+        """Assign a role to a user.
+
+        If the user already has the role, no duplicate is created.
+
+        Args:
+            user_id: The user to assign the role to.
+            role_id: The role to assign.
+
+        Returns:
+            True if the role was assigned (or already existed).
+        """
+        existing = self.db.fetchone(
+            "SELECT id FROM user_roles WHERE user_id = ? AND role_id = ?",
+            (user_id, role_id),
+        )
+        if existing:
+            self._logger.debug(
+                "User %s already has role %s", user_id, role_id,
+            )
+            return True
+
+        try:
+            self.db.insert('user_roles', {
+                'user_id': user_id,
+                'role_id': role_id,
+            })
+            self._logger.info("Assigned role %s to user %s", role_id, user_id)
+            return True
+        except Exception as exc:
+            self._logger.error(
+                "Failed to assign role %s to user %s: %s",
+                role_id, user_id, exc,
+            )
+            return False
+
+    def remove_role(self, user_id: int, role_id: int) -> bool:
+        """Remove a role from a user.
+
+        Args:
+            user_id: The user to remove the role from.
+            role_id: The role to remove.
+
+        Returns:
+            True if the role was removed.
+        """
+        rows = self.db.delete('user_roles', "user_id = ? AND role_id = ?",
+                              (user_id, role_id))
+        return rows > 0
+
+    def get_user_permissions(self, user_id: int) -> List[str]:
+        """Retrieve all permission codes granted to a user via their roles.
+
+        Args:
+            user_id: The user whose permissions to retrieve.
+
+        Returns:
+            Sorted list of unique permission code strings.
+        """
+        rows = self.db.fetchall(
+            "SELECT DISTINCT p.code FROM permissions p "
+            "JOIN role_permissions rp ON p.id = rp.permission_id "
+            "JOIN user_roles ur ON rp.role_id = ur.role_id "
+            "WHERE ur.user_id = ?",
+            (user_id,),
+        )
+        return sorted(row['code'] for row in rows if row.get('code'))
+
+    def get_user_roles(self, user_id: int) -> List[dict]:
+        """Retrieve all roles assigned to a user.
+
+        Args:
+            user_id: The user whose roles to retrieve.
+
+        Returns:
+            List of role dicts with id, name, and display_name.
+        """
+        return self.db.fetchall(
+            "SELECT r.id, r.name, r.display_name, r.description "
+            "FROM roles r "
+            "JOIN user_roles ur ON r.id = ur.role_id "
+            "WHERE ur.user_id = ?",
+            (user_id,),
+        )
+
+
+# =============================================================================
+# SECTION 8: REPORTING ENGINE
+# =============================================================================
+
+
+class ReportEngine(BaseService):
+    """Comprehensive reporting engine for generating payroll, employee,
+    invoice, and financial reports in PDF, Excel, and CSV formats.
+
+    Supports ZATCA-compliant invoice rendering and standard Saudi
+    financial statements (Trial Balance, Profit & Loss, Balance Sheet).
+    """
+
+    # Report output directory prefix
+    _REPORT_PREFIX = "erp_report_"
+
+    def __init__(self, db: DatabaseManager):
+        super().__init__(db)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def generate_payroll_report(
+        self, run_id: int, format: str = "pdf"
+    ) -> str:
+        """Generate a payroll report for a specific payroll run.
+
+        Args:
+            run_id: ID of the payroll run.
+            format: Output format – 'pdf', 'excel', or 'csv'.
+
+        Returns:
+            Absolute path to the generated report file.
+
+        Raises:
+            ValueError: If the payroll run does not exist.
+        """
+        run = self.db.fetchone(
+            "SELECT pr.id, pr.period_id, pr.status, pr.total_employees, "
+            "pr.total_gross, pr.total_net "
+            "FROM payroll_runs pr WHERE pr.id = ?",
+            (run_id,),
+        )
+        if not run:
+            raise ValueError(f"Payroll run {run_id} not found")
+
+        period = self.db.fetchone(
+            "SELECT period_name, period_year, period_month "
+            "FROM payroll_periods WHERE id = ?",
+            (run["period_id"],),
+        )
+        period_label = (
+            period["period_name"]
+            if period
+            else f"Period {run['period_id']}"
+        )
+
+        entries = self.db.fetchall(
+            "SELECT pe.employee_id, e.emp_number, "
+            "e.first_name || ' ' || e.last_name AS employee_name, "
+            "pe.basic_salary, pe.gross_salary, pe.net_salary, "
+            "pe.gosi_employee, pe.gosi_employer, pe.total_deductions, "
+            "COALESCE(pe.gross_salary - pe.basic_salary, 0) AS allowances "
+            "FROM payroll_entries pe "
+            "JOIN employees e ON pe.employee_id = e.id "
+            "WHERE pe.payroll_run_id = ? "
+            "ORDER BY e.emp_number",
+            (run_id,),
+        )
+
+        headers = [
+            "Emp #", "Employee Name", "Basic Salary", "Allowances",
+            "Gross Salary", "GOSI (Emp)", "Deductions", "Net Salary",
+        ]
+        rows: List[list] = []
+        totals = [Decimal(0)] * 6
+        for e in entries:
+            basic = Decimal(str(e["basic_salary"] or 0))
+            allowances = Decimal(str(e["allowances"] or 0))
+            gross = Decimal(str(e["gross_salary"] or 0))
+            gosi_emp = Decimal(str(e["gosi_employee"] or 0))
+            deductions = Decimal(str(e["total_deductions"] or 0))
+            net = Decimal(str(e["net_salary"] or 0))
+            rows.append([
+                e["emp_number"],
+                e["employee_name"],
+                f"{basic:,.2f}",
+                f"{allowances:,.2f}",
+                f"{gross:,.2f}",
+                f"{gosi_emp:,.2f}",
+                f"{deductions:,.2f}",
+                f"{net:,.2f}",
+            ])
+            totals[0] += basic
+            totals[1] += allowances
+            totals[2] += gross
+            totals[3] += gosi_emp
+            totals[4] += deductions
+            totals[5] += net
+
+        rows.append([
+            "", "TOTALS",
+            f"{totals[0]:,.2f}", f"{totals[1]:,.2f}",
+            f"{totals[2]:,.2f}", f"{totals[3]:,.2f}",
+            f"{totals[4]:,.2f}", f"{totals[5]:,.2f}",
+        ])
+
+        title = f"Payroll Report – {period_label}"
+        filename = f"payroll_run_{run_id}"
+
+        return self._render_report(
+            headers, rows, title, filename, format,
+            subtitle=f"Run #{run_id} | Status: {run['status']} | "
+                     f"Employees: {run['total_employees']}",
+        )
+
+    def generate_employee_report(
+        self, company_id: int, format: str = "pdf"
+    ) -> str:
+        """Generate an active-employee roster report for a company.
+
+        Args:
+            company_id: ID of the company.
+            format: Output format – 'pdf', 'excel', or 'csv'.
+
+        Returns:
+            Absolute path to the generated report file.
+        """
+        employees = self.db.fetchall(
+            "SELECT e.emp_number, "
+            "e.first_name || ' ' || e.last_name AS employee_name, "
+            "CASE WHEN e.is_saudi = 1 THEN 'Saudi' ELSE 'Non-Saudi' END "
+            "  AS nationality, "
+            "e.id_number, e.job_title, "
+            "COALESCE(d.name, '') AS department, "
+            "e.hire_date, e.basic_salary, "
+            "COALESCE(e.total_salary, e.basic_salary) AS total_salary "
+            "FROM employees e "
+            "LEFT JOIN departments d ON e.department_id = d.id "
+            "WHERE e.company_id = ? AND e.is_active = 1 "
+            "ORDER BY e.emp_number",
+            (company_id,),
+        )
+
+        headers = [
+            "Emp #", "Name", "Nationality", "ID Number",
+            "Job Title", "Department", "Hire Date",
+            "Basic Salary", "Total Salary",
+        ]
+        rows: List[list] = []
+        for emp in employees:
+            rows.append([
+                emp["emp_number"],
+                emp["employee_name"],
+                emp["nationality"],
+                emp.get("id_number", ""),
+                emp.get("job_title", ""),
+                emp["department"],
+                emp.get("hire_date", ""),
+                f"{Decimal(str(emp['basic_salary'] or 0)):,.2f}",
+                f"{Decimal(str(emp['total_salary'] or 0)):,.2f}",
+            ])
+
+        company = self.db.fetchone(
+            "SELECT name FROM companies WHERE id = ?", (company_id,)
+        )
+        company_name = company["name"] if company else "Company"
+        title = f"Employee Roster – {company_name}"
+        filename = f"employees_company_{company_id}"
+
+        return self._render_report(headers, rows, title, filename, format)
+
+    def generate_invoice_report(
+        self, invoice_id: int, format: str = "pdf"
+    ) -> str:
+        """Generate a formatted invoice document.
+
+        Args:
+            invoice_id: ID of the invoice.
+            format: Output format – 'pdf', 'excel', or 'csv'.
+
+        Returns:
+            Absolute path to the generated report file.
+
+        Raises:
+            ValueError: If the invoice does not exist.
+        """
+        invoice = self.db.fetchone(
+            "SELECT i.id, i.invoice_number, i.invoice_date, i.client_id, "
+            "i.subtotal, i.vat_amount, i.total_amount, i.status, "
+            "i.company_id "
+            "FROM invoices i WHERE i.id = ?",
+            (invoice_id,),
+        )
+        if not invoice:
+            raise ValueError(f"Invoice {invoice_id} not found")
+
+        client = self.db.fetchone(
+            "SELECT name FROM clients WHERE id = ?",
+            (invoice["client_id"],),
+        )
+        company = self.db.fetchone(
+            "SELECT name, name_ar, vat_number, commercial_registration "
+            "FROM companies WHERE id = ?",
+            (invoice.get("company_id", 0),),
+        )
+        lines = self.db.fetchall(
+            "SELECT description, quantity, unit_price, total "
+            "FROM invoice_lines WHERE invoice_id = ?",
+            (invoice_id,),
+        )
+
+        headers = ["#", "Description", "Qty", "Unit Price", "Total"]
+        rows: List[list] = []
+        for idx, line in enumerate(lines, 1):
+            rows.append([
+                str(idx),
+                line["description"],
+                str(line["quantity"]),
+                f"{Decimal(str(line['unit_price'] or 0)):,.2f}",
+                f"{Decimal(str(line['total'] or 0)):,.2f}",
+            ])
+
+        subtotal = Decimal(str(invoice["subtotal"] or 0))
+        vat = Decimal(str(invoice["vat_amount"] or 0))
+        total = Decimal(str(invoice["total_amount"] or 0))
+
+        rows.append(["", "", "", "Subtotal", f"{subtotal:,.2f}"])
+        rows.append(["", "", "", "VAT (15%)", f"{vat:,.2f}"])
+        rows.append(["", "", "", "Total", f"{total:,.2f}"])
+
+        company_name = company["name"] if company else "Company"
+        client_name = client["name"] if client else "Client"
+
+        if format == "pdf" and HAS_REPORTLAB:
+            return self._generate_invoice_pdf(
+                invoice, company, client_name, lines,
+                subtotal, vat, total,
+            )
+
+        title = (
+            f"Invoice {invoice['invoice_number']} – {company_name}"
+        )
+        filename = f"invoice_{invoice['invoice_number']}"
+        return self._render_report(
+            headers, rows, title, filename, format,
+            subtitle=f"Client: {client_name} | Date: "
+                     f"{invoice['invoice_date']} | "
+                     f"Status: {invoice['status']}",
+        )
+
+    def generate_financial_report(
+        self,
+        company_id: int,
+        report_type: str,
+        start_date: str,
+        end_date: str,
+        format: str = "pdf",
+    ) -> str:
+        """Generate a financial statement.
+
+        Args:
+            company_id: ID of the company.
+            report_type: One of 'trial_balance', 'profit_loss',
+                         or 'balance_sheet'.
+            start_date: Start of reporting period (YYYY-MM-DD).
+            end_date: End of reporting period (YYYY-MM-DD).
+            format: Output format – 'pdf', 'excel', or 'csv'.
+
+        Returns:
+            Absolute path to the generated report file.
+
+        Raises:
+            ValueError: If *report_type* is unrecognised.
+        """
+        valid_types = ("trial_balance", "profit_loss", "balance_sheet")
+        if report_type not in valid_types:
+            raise ValueError(
+                f"Invalid report_type '{report_type}'. "
+                f"Must be one of {valid_types}"
+            )
+
+        company = self.db.fetchone(
+            "SELECT name FROM companies WHERE id = ?", (company_id,)
+        )
+        company_name = company["name"] if company else "Company"
+
+        if report_type == "trial_balance":
+            return self._generate_trial_balance(
+                company_id, company_name, start_date, end_date, format,
+            )
+        elif report_type == "profit_loss":
+            return self._generate_profit_loss(
+                company_id, company_name, start_date, end_date, format,
+            )
+        else:
+            return self._generate_balance_sheet(
+                company_id, company_name, start_date, end_date, format,
+            )
+
+    # ------------------------------------------------------------------
+    # Financial sub-reports
+    # ------------------------------------------------------------------
+
+    def _generate_trial_balance(
+        self,
+        company_id: int,
+        company_name: str,
+        start_date: str,
+        end_date: str,
+        format: str,
+    ) -> str:
+        """Build a trial-balance report."""
+        rows_data = self.db.fetchall(
+            "SELECT coa.account_code, coa.account_name, "
+            "COALESCE(SUM(jel.debit), 0) AS total_debit, "
+            "COALESCE(SUM(jel.credit), 0) AS total_credit "
+            "FROM journal_entry_lines jel "
+            "JOIN chart_of_accounts coa ON jel.account_id = coa.id "
+            "JOIN journal_entries je ON jel.entry_id = je.id "
+            "WHERE je.company_id = ? "
+            "AND je.entry_date BETWEEN ? AND ? "
+            "AND je.status = 'posted' "
+            "GROUP BY coa.account_code, coa.account_name "
+            "ORDER BY coa.account_code",
+            (company_id, start_date, end_date),
+        )
+
+        headers = ["Account Code", "Account Name", "Debit", "Credit", "Balance"]
+        rows: List[list] = []
+        total_debit = Decimal(0)
+        total_credit = Decimal(0)
+        for r in rows_data:
+            debit = Decimal(str(r["total_debit"]))
+            credit = Decimal(str(r["total_credit"]))
+            balance = debit - credit
+            rows.append([
+                r["account_code"],
+                r["account_name"],
+                f"{debit:,.2f}",
+                f"{credit:,.2f}",
+                f"{balance:,.2f}",
+            ])
+            total_debit += debit
+            total_credit += credit
+
+        rows.append([
+            "", "TOTALS",
+            f"{total_debit:,.2f}",
+            f"{total_credit:,.2f}",
+            f"{total_debit - total_credit:,.2f}",
+        ])
+
+        title = f"Trial Balance – {company_name}"
+        filename = f"trial_balance_{company_id}_{start_date}_{end_date}"
+        return self._render_report(
+            headers, rows, title, filename, format,
+            subtitle=f"Period: {start_date} to {end_date}",
+        )
+
+    def _generate_profit_loss(
+        self,
+        company_id: int,
+        company_name: str,
+        start_date: str,
+        end_date: str,
+        format: str,
+    ) -> str:
+        """Build a profit-and-loss report."""
+        revenue_rows = self.db.fetchall(
+            "SELECT coa.account_code, coa.account_name, "
+            "COALESCE(SUM(jel.credit), 0) - COALESCE(SUM(jel.debit), 0) "
+            "  AS net_amount "
+            "FROM journal_entry_lines jel "
+            "JOIN chart_of_accounts coa ON jel.account_id = coa.id "
+            "JOIN journal_entries je ON jel.entry_id = je.id "
+            "WHERE je.company_id = ? "
+            "AND je.entry_date BETWEEN ? AND ? "
+            "AND je.status = 'posted' "
+            "AND coa.account_type = 'revenue' "
+            "GROUP BY coa.account_code, coa.account_name "
+            "ORDER BY coa.account_code",
+            (company_id, start_date, end_date),
+        )
+        expense_rows = self.db.fetchall(
+            "SELECT coa.account_code, coa.account_name, "
+            "COALESCE(SUM(jel.debit), 0) - COALESCE(SUM(jel.credit), 0) "
+            "  AS net_amount "
+            "FROM journal_entry_lines jel "
+            "JOIN chart_of_accounts coa ON jel.account_id = coa.id "
+            "JOIN journal_entries je ON jel.entry_id = je.id "
+            "WHERE je.company_id = ? "
+            "AND je.entry_date BETWEEN ? AND ? "
+            "AND je.status = 'posted' "
+            "AND coa.account_type = 'expense' "
+            "GROUP BY coa.account_code, coa.account_name "
+            "ORDER BY coa.account_code",
+            (company_id, start_date, end_date),
+        )
+
+        headers = ["Account Code", "Account Name", "Amount (SAR)"]
+        rows: List[list] = []
+
+        rows.append(["", "--- REVENUE ---", ""])
+        total_revenue = Decimal(0)
+        for r in revenue_rows:
+            amt = Decimal(str(r["net_amount"]))
+            rows.append([r["account_code"], r["account_name"], f"{amt:,.2f}"])
+            total_revenue += amt
+        rows.append(["", "Total Revenue", f"{total_revenue:,.2f}"])
+
+        rows.append(["", "--- EXPENSES ---", ""])
+        total_expenses = Decimal(0)
+        for r in expense_rows:
+            amt = Decimal(str(r["net_amount"]))
+            rows.append([r["account_code"], r["account_name"], f"{amt:,.2f}"])
+            total_expenses += amt
+        rows.append(["", "Total Expenses", f"{total_expenses:,.2f}"])
+
+        net_income = total_revenue - total_expenses
+        rows.append(["", "NET INCOME", f"{net_income:,.2f}"])
+
+        title = f"Profit & Loss – {company_name}"
+        filename = f"profit_loss_{company_id}_{start_date}_{end_date}"
+        return self._render_report(
+            headers, rows, title, filename, format,
+            subtitle=f"Period: {start_date} to {end_date}",
+        )
+
+    def _generate_balance_sheet(
+        self,
+        company_id: int,
+        company_name: str,
+        start_date: str,
+        end_date: str,
+        format: str,
+    ) -> str:
+        """Build a balance-sheet report."""
+        account_data = self.db.fetchall(
+            "SELECT coa.account_code, coa.account_name, "
+            "coa.account_type, "
+            "COALESCE(SUM(jel.debit), 0) AS total_debit, "
+            "COALESCE(SUM(jel.credit), 0) AS total_credit "
+            "FROM journal_entry_lines jel "
+            "JOIN chart_of_accounts coa ON jel.account_id = coa.id "
+            "JOIN journal_entries je ON jel.entry_id = je.id "
+            "WHERE je.company_id = ? "
+            "AND je.entry_date <= ? "
+            "AND je.status = 'posted' "
+            "GROUP BY coa.account_code, coa.account_name, "
+            "         coa.account_type "
+            "ORDER BY coa.account_code",
+            (company_id, end_date),
+        )
+
+        headers = ["Account Code", "Account Name", "Amount (SAR)"]
+        rows: List[list] = []
+        section_totals: Dict[str, Decimal] = defaultdict(Decimal)
+
+        sections = {
+            "asset": "ASSETS",
+            "liability": "LIABILITIES",
+            "equity": "EQUITY",
+        }
+        grouped: Dict[str, list] = defaultdict(list)
+        for acct in account_data:
+            atype = acct["account_type"]
+            grouped[atype].append(acct)
+
+        for atype, label in sections.items():
+            rows.append(["", f"--- {label} ---", ""])
+            for acct in grouped.get(atype, []):
+                debit = Decimal(str(acct["total_debit"]))
+                credit = Decimal(str(acct["total_credit"]))
+                if atype == "asset":
+                    balance = debit - credit
+                else:
+                    balance = credit - debit
+                rows.append([
+                    acct["account_code"],
+                    acct["account_name"],
+                    f"{balance:,.2f}",
+                ])
+                section_totals[atype] += balance
+            rows.append(["", f"Total {label}", f"{section_totals[atype]:,.2f}"])
+
+        le_total = section_totals["liability"] + section_totals["equity"]
+        rows.append(["", "TOTAL LIABILITIES + EQUITY", f"{le_total:,.2f}"])
+
+        title = f"Balance Sheet – {company_name}"
+        filename = f"balance_sheet_{company_id}_{end_date}"
+        return self._render_report(
+            headers, rows, title, filename, format,
+            subtitle=f"As of {end_date}",
+        )
+
+    # ------------------------------------------------------------------
+    # Invoice-specific PDF generation
+    # ------------------------------------------------------------------
+
+    def _generate_invoice_pdf(
+        self,
+        invoice: dict,
+        company: Optional[dict],
+        client_name: str,
+        lines: List[dict],
+        subtotal: Decimal,
+        vat: Decimal,
+        total: Decimal,
+    ) -> str:
+        """Create a professional invoice PDF with optional ZATCA QR."""
+        filepath = os.path.join(
+            tempfile.gettempdir(),
+            f"{self._REPORT_PREFIX}invoice_{invoice['invoice_number']}.pdf",
+        )
+        doc = SimpleDocTemplate(filepath, pagesize=A4)
+        styles = getSampleStyleSheet()
+        elements: List[Any] = []
+
+        # Company header
+        company_name = company["name"] if company else "Company"
+        company_name_ar = company.get("name_ar", "") if company else ""
+        vat_number = company.get("vat_number", "") if company else ""
+        cr_number = (
+            company.get("commercial_registration", "") if company else ""
+        )
+
+        header_style = ParagraphStyle(
+            "InvoiceHeader", parent=styles["Heading1"],
+            fontSize=18, spaceAfter=6,
+        )
+        elements.append(Paragraph(company_name, header_style))
+        if company_name_ar:
+            elements.append(Paragraph(company_name_ar, styles["Heading2"]))
+        if vat_number:
+            elements.append(
+                Paragraph(f"VAT #: {vat_number}", styles["Normal"])
+            )
+        if cr_number:
+            elements.append(
+                Paragraph(f"CR #: {cr_number}", styles["Normal"])
+            )
+        elements.append(Spacer(1, 12))
+
+        # Invoice meta
+        meta_style = ParagraphStyle(
+            "InvoiceMeta", parent=styles["Normal"], fontSize=10,
+        )
+        elements.append(
+            Paragraph(
+                f"<b>Invoice:</b> {invoice['invoice_number']}", meta_style,
+            )
+        )
+        elements.append(
+            Paragraph(
+                f"<b>Date:</b> {invoice['invoice_date']}", meta_style,
+            )
+        )
+        elements.append(
+            Paragraph(f"<b>Client:</b> {client_name}", meta_style)
+        )
+        elements.append(
+            Paragraph(
+                f"<b>Status:</b> {invoice['status']}", meta_style,
+            )
+        )
+        elements.append(Spacer(1, 12))
+
+        # Line items table
+        table_data = [["#", "Description", "Qty", "Unit Price", "Total"]]
+        for idx, line in enumerate(lines, 1):
+            table_data.append([
+                str(idx),
+                line["description"],
+                str(line["quantity"]),
+                f"{Decimal(str(line['unit_price'] or 0)):,.2f}",
+                f"{Decimal(str(line['total'] or 0)):,.2f}",
+            ])
+
+        table_data.append(["", "", "", "Subtotal", f"{subtotal:,.2f}"])
+        table_data.append(["", "", "", "VAT (15%)", f"{vat:,.2f}"])
+        table_data.append(["", "", "", "Total (SAR)", f"{total:,.2f}"])
+
+        col_widths = [0.5 * inch, 3.0 * inch, 0.7 * inch, 1.2 * inch, 1.2 * inch]
+        table = Table(table_data, colWidths=col_widths)
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 9),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("ALIGN", (1, 1), (1, -1), "LEFT"),
+            ("GRID", (0, 0), (-1, -4), 0.5, colors.grey),
+            ("LINEABOVE", (3, -3), (-1, -3), 1, colors.black),
+            ("LINEABOVE", (3, -1), (-1, -1), 1.5, colors.black),
+            ("FONTNAME", (0, -3), (-1, -1), "Helvetica-Bold"),
+            ("BACKGROUND", (0, 1), (-1, -4), colors.HexColor("#ecf0f1")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -4),
+             [colors.white, colors.HexColor("#ecf0f1")]),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        elements.append(table)
+        elements.append(Spacer(1, 18))
+
+        # ZATCA TLV QR code
+        qr_data = self._build_zatca_tlv(
+            company_name, vat_number,
+            str(invoice["invoice_date"]),
+            str(total), str(vat),
+        )
+        if qr_data and HAS_QRCODE:
+            try:
+                qr_img = qrcode.make(qr_data)
+                buf = io.BytesIO()
+                qr_img.save(buf, format="PNG")
+                buf.seek(0)
+                elements.append(
+                    Paragraph("ZATCA QR Code:", styles["Heading4"])
+                )
+                elements.append(RLImage(buf, width=1.5 * inch, height=1.5 * inch))
+            except Exception as exc:
+                self._logger.warning("QR generation failed: %s", exc)
+
+        try:
+            doc.build(elements)
+        except Exception as exc:
+            self._logger.error("PDF build failed: %s", exc)
+            raise
+        self._logger.info("Invoice PDF generated: %s", filepath)
+        return filepath
+
+    # ------------------------------------------------------------------
+    # ZATCA TLV helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_zatca_tlv(
+        seller: str,
+        vat_number: str,
+        timestamp: str,
+        total: str,
+        vat_amount: str,
+    ) -> Optional[str]:
+        """Build a Base64-encoded ZATCA TLV string for QR codes.
+
+        Returns:
+            Base64 string or ``None`` when inputs are insufficient.
+        """
+        if not seller or not vat_number:
+            return None
+        try:
+            tlv = b""
+            for tag, value in [
+                (1, seller),
+                (2, vat_number),
+                (3, timestamp),
+                (4, total),
+                (5, vat_amount),
+            ]:
+                encoded = value.encode("utf-8")
+                tlv += bytes([tag, len(encoded)]) + encoded
+            return base64.b64encode(tlv).decode("ascii")
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # PDF header helper
+    # ------------------------------------------------------------------
+
+    def _create_pdf_header(
+        self, canvas_obj: Any, title: str, company_name: str
+    ) -> None:
+        """Draw a standard header on a reportlab canvas page.
+
+        Args:
+            canvas_obj: A ``reportlab.pdfgen.canvas.Canvas`` instance.
+            title: The report title.
+            company_name: Company name rendered above the title.
+        """
+        canvas_obj.saveState()
+        canvas_obj.setFont("Helvetica-Bold", 14)
+        page_w, _ = A4
+        canvas_obj.drawCentredString(
+            page_w / 2, 800, company_name,
+        )
+        canvas_obj.setFont("Helvetica", 11)
+        canvas_obj.drawCentredString(page_w / 2, 780, title)
+        canvas_obj.setFont("Helvetica", 8)
+        canvas_obj.drawRightString(
+            page_w - 40, 800,
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        )
+        canvas_obj.line(40, 775, page_w - 40, 775)
+        canvas_obj.restoreState()
+
+    # ------------------------------------------------------------------
+    # Unified rendering dispatcher
+    # ------------------------------------------------------------------
+
+    def _render_report(
+        self,
+        headers: List[str],
+        rows: List[list],
+        title: str,
+        filename: str,
+        format: str,
+        subtitle: str = "",
+    ) -> str:
+        """Route report generation to the appropriate format handler.
+
+        Args:
+            headers: Column header strings.
+            rows: Row data (list of lists).
+            title: Report title.
+            filename: Base filename (without extension).
+            format: 'pdf', 'excel', or 'csv'.
+            subtitle: Optional subtitle line.
+
+        Returns:
+            Absolute path to the generated file.
+        """
+        fmt = format.lower().strip()
+        if fmt == "pdf" and HAS_REPORTLAB:
+            return self._generate_pdf(headers, rows, title, filename, subtitle)
+        elif fmt == "excel" and HAS_OPENPYXL:
+            return self._generate_excel(headers, rows, title, filename)
+        else:
+            if fmt not in ("csv",) and fmt == "pdf" and not HAS_REPORTLAB:
+                self._logger.warning(
+                    "reportlab unavailable; falling back to CSV"
+                )
+            elif fmt not in ("csv",) and fmt == "excel" and not HAS_OPENPYXL:
+                self._logger.warning(
+                    "openpyxl unavailable; falling back to CSV"
+                )
+            return self._generate_csv_fallback(headers, rows, filename)
+
+    # ------------------------------------------------------------------
+    # PDF generation (reportlab)
+    # ------------------------------------------------------------------
+
+    def _generate_pdf(
+        self,
+        headers: List[str],
+        rows: List[list],
+        title: str,
+        filename: str,
+        subtitle: str = "",
+    ) -> str:
+        """Generate a PDF report using reportlab.
+
+        Args:
+            headers: Column headers.
+            rows: Data rows (list of lists).
+            title: Report title.
+            filename: Base filename.
+            subtitle: Optional subtitle.
+
+        Returns:
+            Absolute path to the PDF file.
+        """
+        filepath = os.path.join(
+            tempfile.gettempdir(),
+            f"{self._REPORT_PREFIX}{filename}.pdf",
+        )
+        page_size = landscape(A4) if len(headers) > 6 else A4
+        doc = SimpleDocTemplate(
+            filepath, pagesize=page_size,
+            leftMargin=36, rightMargin=36,
+            topMargin=50, bottomMargin=36,
+        )
+        styles = getSampleStyleSheet()
+        elements: List[Any] = []
+
+        title_style = ParagraphStyle(
+            "ReportTitle", parent=styles["Heading1"],
+            fontSize=16, spaceAfter=4, alignment=1,
+        )
+        elements.append(Paragraph(title, title_style))
+
+        if subtitle:
+            sub_style = ParagraphStyle(
+                "ReportSubtitle", parent=styles["Normal"],
+                fontSize=9, alignment=1, spaceAfter=10,
+                textColor=colors.HexColor("#555555"),
+            )
+            elements.append(Paragraph(subtitle, sub_style))
+
+        elements.append(Spacer(1, 8))
+
+        # Build table
+        table_data = [headers] + rows
+        num_cols = len(headers)
+        avail_width = (
+            page_size[0] - doc.leftMargin - doc.rightMargin
+        )
+        col_width = avail_width / num_cols
+        col_widths = [col_width] * num_cols
+
+        table = Table(table_data, colWidths=col_widths, repeatRows=1)
+        style_commands = [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 8),
+            ("FONTSIZE", (0, 1), (-1, -1), 7),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -2),
+             [colors.white, colors.HexColor("#f5f6fa")]),
+        ]
+        if rows:
+            style_commands.append(
+                ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold")
+            )
+            style_commands.append(
+                ("LINEABOVE", (0, -1), (-1, -1), 1, colors.black)
+            )
+        table.setStyle(TableStyle(style_commands))
+        elements.append(table)
+
+        # Footer with generation timestamp
+        elements.append(Spacer(1, 14))
+        footer_style = ParagraphStyle(
+            "ReportFooter", parent=styles["Normal"],
+            fontSize=7, textColor=colors.HexColor("#999999"),
+        )
+        elements.append(Paragraph(
+            f"Generated on "
+            f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            footer_style,
+        ))
+
+        try:
+            doc.build(elements)
+        except Exception as exc:
+            self._logger.error("PDF generation failed: %s", exc)
+            raise
+        self._logger.info("PDF report generated: %s", filepath)
+        return filepath
+
+    # ------------------------------------------------------------------
+    # Excel generation (openpyxl)
+    # ------------------------------------------------------------------
+
+    def _generate_excel(
+        self,
+        headers: List[str],
+        rows: List[list],
+        title: str,
+        filename: str,
+    ) -> str:
+        """Generate an Excel workbook using openpyxl.
+
+        Args:
+            headers: Column headers.
+            rows: Data rows.
+            title: Worksheet title (truncated to 31 chars for Excel).
+            filename: Base filename.
+
+        Returns:
+            Absolute path to the Excel file.
+        """
+        filepath = os.path.join(
+            tempfile.gettempdir(),
+            f"{self._REPORT_PREFIX}{filename}.xlsx",
+        )
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = title[:31]
+
+        # Header styling
+        header_font = Font(bold=True, color="FFFFFF", size=10)
+        header_fill = PatternFill(
+            start_color="2C3E50", end_color="2C3E50", fill_type="solid",
+        )
+        header_alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True,
+        )
+        thin_border = Border(
+            left=Side(style="thin"),
+            right=Side(style="thin"),
+            top=Side(style="thin"),
+            bottom=Side(style="thin"),
+        )
+
+        # Title row
+        ws.merge_cells(
+            start_row=1, start_column=1,
+            end_row=1, end_column=len(headers),
+        )
+        title_cell = ws.cell(row=1, column=1, value=title)
+        title_cell.font = Font(bold=True, size=14)
+        title_cell.alignment = Alignment(horizontal="center")
+
+        # Timestamp row
+        ws.merge_cells(
+            start_row=2, start_column=1,
+            end_row=2, end_column=len(headers),
+        )
+        ts_cell = ws.cell(
+            row=2, column=1,
+            value=f"Generated: "
+                  f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        )
+        ts_cell.font = Font(italic=True, size=8, color="999999")
+        ts_cell.alignment = Alignment(horizontal="center")
+
+        header_row = 4
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=header_row, column=col_idx, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
+            cell.border = thin_border
+
+        # Data rows
+        alt_fill = PatternFill(
+            start_color="F5F6FA", end_color="F5F6FA", fill_type="solid",
+        )
+        data_alignment = Alignment(horizontal="center", vertical="center")
+        for row_idx, row in enumerate(rows, header_row + 1):
+            for col_idx, value in enumerate(row, 1):
+                cell = ws.cell(row=row_idx, column=col_idx, value=value)
+                cell.border = thin_border
+                cell.alignment = data_alignment
+                if (row_idx - header_row) % 2 == 0:
+                    cell.fill = alt_fill
+
+        # Bold last row (totals)
+        if rows:
+            last_row = header_row + len(rows)
+            for col_idx in range(1, len(headers) + 1):
+                cell = ws.cell(row=last_row, column=col_idx)
+                cell.font = Font(bold=True, size=10)
+
+        # Auto-column widths
+        for col_idx in range(1, len(headers) + 1):
+            max_len = len(str(headers[col_idx - 1]))
+            for row in rows:
+                if col_idx - 1 < len(row):
+                    max_len = max(max_len, len(str(row[col_idx - 1])))
+            adjusted = min(max_len + 4, 50)
+            ws.column_dimensions[
+                get_column_letter(col_idx)
+            ].width = adjusted
+
+        # Freeze header
+        ws.freeze_panes = f"A{header_row + 1}"
+
+        try:
+            wb.save(filepath)
+        except Exception as exc:
+            self._logger.error("Excel generation failed: %s", exc)
+            raise
+        self._logger.info("Excel report generated: %s", filepath)
+        return filepath
+
+    # ------------------------------------------------------------------
+    # CSV fallback
+    # ------------------------------------------------------------------
+
+    def _generate_csv_fallback(
+        self,
+        headers: List[str],
+        rows: List[list],
+        filename: str,
+    ) -> str:
+        """Generate a CSV file as a universal fallback.
+
+        Args:
+            headers: Column headers.
+            rows: Data rows.
+            filename: Base filename.
+
+        Returns:
+            Absolute path to the CSV file.
+        """
+        filepath = os.path.join(
+            tempfile.gettempdir(),
+            f"{self._REPORT_PREFIX}{filename}.csv",
+        )
+        try:
+            with open(filepath, "w", newline="", encoding="utf-8-sig") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(headers)
+                writer.writerows(rows)
+        except Exception as exc:
+            self._logger.error("CSV generation failed: %s", exc)
+            raise
+        self._logger.info("CSV report generated: %s", filepath)
+        return filepath
+
+
+# =============================================================================
+# SECTION 9: AI INSIGHTS ENGINE
+# =============================================================================
+
+
+class AIInsightsEngine(BaseService):
+    """Analytics engine providing business intelligence via statistical analysis.
+
+    All methods handle missing data gracefully and return structured dicts
+    with sensible defaults when data is insufficient.
+    """
+
+    # Thresholds ----------------------------------------------------------
+    _ANOMALY_PCT_THRESHOLD = 0.20  # 20 % deviation from average
+    _HIGH_RISK_TENURE_LOW = 1      # years
+    _HIGH_RISK_TENURE_HIGH = 10    # years
+    _EXCESSIVE_LEAVE_FACTOR = 1.5  # times average
+
+    # ------------------------------------------------------------------
+    # Payroll trend analysis
+    # ------------------------------------------------------------------
+
+    def analyze_payroll_trends(self, company_id: int, months: int = 12) -> dict:
+        """Analyse payroll cost trends over the last *months* periods.
+
+        Args:
+            company_id: Target company identifier.
+            months: Number of months to look back (default 12).
+
+        Returns:
+            Dict with *monthly_data*, *overall_trend*, *average_monthly_cost*,
+            *total_cost* and *growth_rate*.
+        """
+        self._logger.info(
+            "Analysing payroll trends for company %s over %d months",
+            company_id, months,
+        )
+        result: Dict[str, Any] = {
+            "monthly_data": [],
+            "overall_trend": "stable",
+            "average_monthly_cost": 0.0,
+            "total_cost": 0.0,
+            "growth_rate": 0.0,
+        }
+
+        rows = self.db.fetchall(
+            """
+            SELECT pr.period_id,
+                   pp.period_year,
+                   pp.period_month,
+                   pr.total_employees,
+                   pr.total_gross,
+                   pr.total_net
+              FROM payroll_runs pr
+              JOIN payroll_periods pp ON pp.id = pr.period_id
+             WHERE pp.company_id = ?
+               AND pr.status IN ('completed', 'approved', 'posted')
+             ORDER BY pp.period_year DESC, pp.period_month DESC
+             LIMIT ?
+            """,
+            (company_id, months),
+        )
+
+        if not rows:
+            self._logger.warning("No payroll data found for company %s", company_id)
+            return result
+
+        monthly_data: List[Dict[str, Any]] = []
+        costs: List[float] = []
+        for row in reversed(rows):
+            total_gross = float(row["total_gross"] or 0)
+            total_net = float(row["total_net"] or 0)
+            headcount = int(row["total_employees"] or 0)
+            avg_salary = total_gross / headcount if headcount else 0.0
+            monthly_data.append({
+                "period_year": int(row["period_year"]),
+                "period_month": int(row["period_month"]),
+                "total_gross": round(total_gross, 2),
+                "total_net": round(total_net, 2),
+                "headcount": headcount,
+                "average_salary": round(avg_salary, 2),
+            })
+            costs.append(total_gross)
+
+        # Month-over-month growth rates
+        for i in range(1, len(monthly_data)):
+            prev = costs[i - 1]
+            curr = costs[i]
+            mom = ((curr - prev) / prev * 100) if prev else 0.0
+            monthly_data[i]["mom_growth"] = round(mom, 2)
+        if monthly_data:
+            monthly_data[0]["mom_growth"] = 0.0
+
+        total_cost = sum(costs)
+        avg_cost = total_cost / len(costs) if costs else 0.0
+
+        # Overall growth rate (first→last)
+        growth_rate = 0.0
+        if len(costs) >= 2 and costs[0] > 0:
+            growth_rate = (costs[-1] - costs[0]) / costs[0] * 100
+
+        # Trend determination via simple linear tendency
+        if len(costs) >= 3:
+            first_half = statistics.mean(costs[: len(costs) // 2])
+            second_half = statistics.mean(costs[len(costs) // 2:])
+            if second_half > first_half * 1.05:
+                trend = "increasing"
+            elif second_half < first_half * 0.95:
+                trend = "decreasing"
+            else:
+                trend = "stable"
+        else:
+            trend = "stable"
+
+        result.update({
+            "monthly_data": monthly_data,
+            "overall_trend": trend,
+            "average_monthly_cost": round(avg_cost, 2),
+            "total_cost": round(total_cost, 2),
+            "growth_rate": round(growth_rate, 2),
+        })
+        return result
+
+    # ------------------------------------------------------------------
+    # Anomaly detection
+    # ------------------------------------------------------------------
+
+    def detect_payroll_anomalies(self, company_id: int, period_id: int) -> dict:
+        """Compare current-period payroll entries against historical averages.
+
+        Flags entries where gross salary deviates by more than 20 % from the
+        employee's own historical average, or where deductions are unusually high.
+
+        Args:
+            company_id: Target company identifier.
+            period_id: The payroll period to check.
+
+        Returns:
+            Dict with *anomalies* list, *total_checked* and *anomaly_count*.
+        """
+        self._logger.info(
+            "Detecting payroll anomalies for company %s, period %s",
+            company_id, period_id,
+        )
+        result: Dict[str, Any] = {
+            "anomalies": [],
+            "total_checked": 0,
+            "anomaly_count": 0,
+        }
+
+        current_entries = self.db.fetchall(
+            """
+            SELECT pe.employee_id, pe.basic_salary, pe.gross_salary,
+                   pe.net_salary, pe.total_deductions, pe.absence_deduction,
+                   pe.gosi_employee, pe.gosi_employer,
+                   e.first_name, e.last_name, e.emp_number
+              FROM payroll_entries pe
+              JOIN employees e ON e.id = pe.employee_id
+             WHERE pe.period_id = ?
+               AND e.company_id = ?
+            """,
+            (period_id, company_id),
+        )
+
+        if not current_entries:
+            return result
+
+        anomalies: List[Dict[str, Any]] = []
+
+        for entry in current_entries:
+            emp_id = entry["employee_id"]
+            current_gross = float(entry["gross_salary"] or 0)
+            current_deductions = float(entry["total_deductions"] or 0)
+
+            hist = self.db.fetchone(
+                """
+                SELECT AVG(gross_salary) AS avg_gross,
+                       AVG(total_deductions) AS avg_deductions,
+                       COUNT(*) AS period_count
+                  FROM payroll_entries
+                 WHERE employee_id = ?
+                   AND period_id != ?
+                """,
+                (emp_id, period_id),
+            )
+
+            if not hist or not hist["period_count"]:
+                continue
+
+            avg_gross = float(hist["avg_gross"] or 0)
+            avg_deductions = float(hist["avg_deductions"] or 0)
+            reasons: List[str] = []
+
+            if avg_gross > 0 and abs(current_gross - avg_gross) / avg_gross > self._ANOMALY_PCT_THRESHOLD:
+                direction = "higher" if current_gross > avg_gross else "lower"
+                pct = abs(current_gross - avg_gross) / avg_gross * 100
+                reasons.append(
+                    f"Gross salary {direction} than average by {pct:.1f}%"
+                )
+
+            if avg_deductions > 0 and current_deductions > 0:
+                if current_deductions / avg_deductions > (1 + self._ANOMALY_PCT_THRESHOLD):
+                    pct = (current_deductions - avg_deductions) / avg_deductions * 100
+                    reasons.append(
+                        f"Deductions higher than average by {pct:.1f}%"
+                    )
+
+            absence = float(entry["absence_deduction"] or 0)
+            if absence > current_gross * 0.10:
+                reasons.append(
+                    f"Absence deduction exceeds 10% of gross ({absence:.2f})"
+                )
+
+            if reasons:
+                anomalies.append({
+                    "employee_id": emp_id,
+                    "emp_number": entry["emp_number"],
+                    "employee_name": f"{entry['first_name']} {entry['last_name']}",
+                    "current_gross": round(current_gross, 2),
+                    "historical_avg_gross": round(avg_gross, 2),
+                    "current_deductions": round(current_deductions, 2),
+                    "historical_avg_deductions": round(avg_deductions, 2),
+                    "reasons": reasons,
+                })
+
+        result.update({
+            "anomalies": anomalies,
+            "total_checked": len(current_entries),
+            "anomaly_count": len(anomalies),
+        })
+        return result
+
+    # ------------------------------------------------------------------
+    # Turnover prediction
+    # ------------------------------------------------------------------
+
+    def predict_employee_turnover(self, company_id: int) -> dict:
+        """Simple turnover-risk prediction based on tenure, leave and history.
+
+        Risk factors:
+        * Tenure < 1 year or > 10 years → higher risk.
+        * Recent excessive leave usage → higher risk.
+        * Departments with high historical termination rates → higher risk.
+
+        Args:
+            company_id: Target company identifier.
+
+        Returns:
+            Dict with *at_risk_employees*, *risk_factors* and
+            *overall_turnover_rate*.
+        """
+        self._logger.info("Predicting turnover for company %s", company_id)
+        result: Dict[str, Any] = {
+            "at_risk_employees": [],
+            "risk_factors": [],
+            "overall_turnover_rate": 0.0,
+        }
+
+        today = datetime.date.today()
+
+        employees = self.db.fetchall(
+            """
+            SELECT id, emp_number, first_name, last_name,
+                   hire_date, department_id, is_active
+              FROM employees
+             WHERE company_id = ? AND is_active = 1
+            """,
+            (company_id,),
+        )
+
+        if not employees:
+            return result
+
+        # Historical termination rate per department
+        dept_term = self.db.fetchall(
+            """
+            SELECT department_id,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN is_active = 0 THEN 1 ELSE 0 END) AS terminated
+              FROM employees
+             WHERE company_id = ?
+             GROUP BY department_id
+            """,
+            (company_id,),
+        )
+        dept_rates: Dict[int, float] = {}
+        for dt in (dept_term or []):
+            total = int(dt["total"] or 1)
+            terminated = int(dt["terminated"] or 0)
+            dept_rates[dt["department_id"]] = terminated / total if total else 0.0
+
+        # Overall turnover rate
+        total_all = self.db.fetchscalar(
+            "SELECT COUNT(*) FROM employees WHERE company_id = ?",
+            (company_id,),
+        ) or 1
+        terminated_all = self.db.fetchscalar(
+            "SELECT COUNT(*) FROM employees WHERE company_id = ? AND is_active = 0",
+            (company_id,),
+        ) or 0
+        overall_rate = terminated_all / total_all * 100 if total_all else 0.0
+
+        # Average leave usage across company (last 12 months)
+        avg_leave = self.db.fetchscalar(
+            """
+            SELECT AVG(total_days)
+              FROM leave_requests lr
+              JOIN employees e ON e.id = lr.employee_id
+             WHERE e.company_id = ?
+               AND lr.status = 'approved'
+               AND lr.start_date >= ?
+            """,
+            (company_id, (today - datetime.timedelta(days=365)).isoformat()),
+        ) or 0.0
+
+        at_risk: List[Dict[str, Any]] = []
+        global_factors: List[str] = []
+
+        for emp in employees:
+            risk_score = 0.0
+            factors: List[str] = []
+
+            hire_date = emp["hire_date"]
+            if hire_date:
+                try:
+                    hd = datetime.date.fromisoformat(str(hire_date)[:10])
+                    tenure_years = (today - hd).days / 365.25
+                except (ValueError, TypeError):
+                    tenure_years = 0.0
+            else:
+                tenure_years = 0.0
+
+            if tenure_years < self._HIGH_RISK_TENURE_LOW:
+                risk_score += 30
+                factors.append(f"Short tenure ({tenure_years:.1f} yrs)")
+            elif tenure_years > self._HIGH_RISK_TENURE_HIGH:
+                risk_score += 15
+                factors.append(f"Very long tenure ({tenure_years:.1f} yrs)")
+
+            emp_leave = self.db.fetchscalar(
+                """
+                SELECT COALESCE(SUM(total_days), 0)
+                  FROM leave_requests
+                 WHERE employee_id = ?
+                   AND status = 'approved'
+                   AND start_date >= ?
+                """,
+                (emp["id"], (today - datetime.timedelta(days=365)).isoformat()),
+            ) or 0
+            avg_leave_f = float(avg_leave)
+            if avg_leave_f > 0 and float(emp_leave) > avg_leave_f * self._EXCESSIVE_LEAVE_FACTOR:
+                risk_score += 25
+                factors.append(f"Excessive leave ({emp_leave} days vs avg {avg_leave_f:.1f})")
+
+            dept_id = emp["department_id"]
+            dept_rate = dept_rates.get(dept_id, 0.0)
+            if dept_rate > 0.20:
+                risk_score += 20
+                factors.append(f"High-turnover department ({dept_rate * 100:.0f}%)")
+
+            if risk_score >= 30:
+                at_risk.append({
+                    "employee_id": emp["id"],
+                    "emp_number": emp["emp_number"],
+                    "employee_name": f"{emp['first_name']} {emp['last_name']}",
+                    "risk_score": min(round(risk_score, 1), 100),
+                    "tenure_years": round(tenure_years, 1),
+                    "risk_factors": factors,
+                })
+
+        at_risk.sort(key=lambda x: x["risk_score"], reverse=True)
+
+        if any(r for r in at_risk if "Short tenure" in str(r["risk_factors"])):
+            global_factors.append("New-hire retention risk detected")
+        if any(dept_rates.get(d, 0) > 0.20 for d in dept_rates):
+            global_factors.append("Departments with >20% historical turnover present")
+
+        result.update({
+            "at_risk_employees": at_risk,
+            "risk_factors": global_factors,
+            "overall_turnover_rate": round(overall_rate, 2),
+        })
+        return result
+
+    # ------------------------------------------------------------------
+    # Attendance / absence pattern analysis
+    # ------------------------------------------------------------------
+
+    def analyze_attendance_patterns(self, company_id: int, months: int = 3) -> dict:
+        """Analyse leave-request patterns across the organisation.
+
+        Identifies departments with high absence rates and peak absence
+        periods.  Uses *leave_requests* rather than raw attendance to
+        ensure availability across all deployments.
+
+        Args:
+            company_id: Target company identifier.
+            months: Look-back window in months (default 3).
+
+        Returns:
+            Dict with *department_stats*, *monthly_stats* and
+            *top_absent_employees*.
+        """
+        self._logger.info(
+            "Analysing attendance patterns for company %s over %d months",
+            company_id, months,
+        )
+        result: Dict[str, Any] = {
+            "department_stats": [],
+            "monthly_stats": [],
+            "top_absent_employees": [],
+        }
+
+        cutoff = (
+            datetime.date.today() - datetime.timedelta(days=months * 30)
+        ).isoformat()
+
+        leave_rows = self.db.fetchall(
+            """
+            SELECT lr.employee_id, lr.total_days, lr.start_date,
+                   e.department_id, e.first_name, e.last_name,
+                   e.emp_number
+              FROM leave_requests lr
+              JOIN employees e ON e.id = lr.employee_id
+             WHERE e.company_id = ?
+               AND lr.status = 'approved'
+               AND lr.start_date >= ?
+            """,
+            (company_id, cutoff),
+        )
+
+        if not leave_rows:
+            return result
+
+        dept_days: Dict[Any, float] = defaultdict(float)
+        dept_count: Dict[Any, int] = defaultdict(int)
+        month_days: Dict[str, float] = defaultdict(float)
+        emp_days: Dict[int, Dict[str, Any]] = {}
+
+        for row in leave_rows:
+            dept = row["department_id"]
+            days = float(row["total_days"] or 0)
+            dept_days[dept] += days
+            dept_count[dept] += 1
+
+            try:
+                sd = str(row["start_date"])[:7]  # YYYY-MM
+            except (ValueError, TypeError):
+                sd = "unknown"
+            month_days[sd] += days
+
+            eid = row["employee_id"]
+            if eid not in emp_days:
+                emp_days[eid] = {
+                    "employee_id": eid,
+                    "emp_number": row["emp_number"],
+                    "employee_name": f"{row['first_name']} {row['last_name']}",
+                    "department_id": dept,
+                    "total_days": 0.0,
+                    "request_count": 0,
+                }
+            emp_days[eid]["total_days"] += days
+            emp_days[eid]["request_count"] += 1
+
+        # Department stats
+        dept_headcounts = self.db.fetchall(
+            """
+            SELECT department_id, COUNT(*) AS cnt
+              FROM employees
+             WHERE company_id = ? AND is_active = 1
+             GROUP BY department_id
+            """,
+            (company_id,),
+        )
+        headcount_map: Dict[Any, int] = {
+            r["department_id"]: int(r["cnt"]) for r in (dept_headcounts or [])
+        }
+
+        department_stats = []
+        for dept, days in sorted(dept_days.items(), key=lambda x: x[1], reverse=True):
+            hc = headcount_map.get(dept, 1)
+            department_stats.append({
+                "department_id": dept,
+                "total_absence_days": round(days, 1),
+                "request_count": dept_count[dept],
+                "headcount": hc,
+                "avg_days_per_employee": round(days / hc, 1) if hc else 0.0,
+            })
+
+        # Monthly stats
+        monthly_stats = [
+            {"month": m, "total_days": round(d, 1)}
+            for m, d in sorted(month_days.items())
+        ]
+
+        # Top absent employees (top 10)
+        top_absent = sorted(
+            emp_days.values(), key=lambda x: x["total_days"], reverse=True
+        )[:10]
+        for ea in top_absent:
+            ea["total_days"] = round(ea["total_days"], 1)
+
+        result.update({
+            "department_stats": department_stats,
+            "monthly_stats": monthly_stats,
+            "top_absent_employees": top_absent,
+        })
+        return result
+
+    # ------------------------------------------------------------------
+    # Financial insights
+    # ------------------------------------------------------------------
+
+    def generate_financial_insights(self, company_id: int, months: int = 12) -> dict:
+        """Analyse revenue-vs-expense trends from journal entries.
+
+        Computes monthly revenue, expenses and profit margins using the
+        chart of accounts to classify journal-entry lines.
+
+        Args:
+            company_id: Target company identifier.
+            months: Look-back window in months (default 12).
+
+        Returns:
+            Dict with *monthly_financials*, *revenue_trend*,
+            *expense_trend* and *profit_margin*.
+        """
+        self._logger.info(
+            "Generating financial insights for company %s over %d months",
+            company_id, months,
+        )
+        result: Dict[str, Any] = {
+            "monthly_financials": [],
+            "revenue_trend": "stable",
+            "expense_trend": "stable",
+            "profit_margin": 0.0,
+        }
+
+        cutoff = (
+            datetime.date.today() - datetime.timedelta(days=months * 30)
+        ).isoformat()
+
+        rows = self.db.fetchall(
+            """
+            SELECT strftime('%Y-%m', je.entry_date) AS month,
+                   coa.account_type,
+                   SUM(jel.debit)  AS total_debit,
+                   SUM(jel.credit) AS total_credit
+              FROM journal_entries je
+              JOIN journal_entry_lines jel ON jel.entry_id = je.id
+              JOIN chart_of_accounts coa ON coa.id = jel.account_id
+             WHERE coa.company_id = ?
+               AND je.status IN ('posted', 'approved')
+               AND je.entry_date >= ?
+             GROUP BY month, coa.account_type
+             ORDER BY month
+            """,
+            (company_id, cutoff),
+        )
+
+        if not rows:
+            return result
+
+        month_map: Dict[str, Dict[str, float]] = defaultdict(
+            lambda: {"revenue": 0.0, "expense": 0.0}
+        )
+        for row in rows:
+            m = row["month"]
+            atype = (row["account_type"] or "").lower()
+            debit = float(row["total_debit"] or 0)
+            credit = float(row["total_credit"] or 0)
+            if atype == "revenue":
+                month_map[m]["revenue"] += credit - debit
+            elif atype == "expense":
+                month_map[m]["expense"] += debit - credit
+
+        monthly_financials: List[Dict[str, Any]] = []
+        revenues: List[float] = []
+        expenses: List[float] = []
+        for m in sorted(month_map):
+            rev = month_map[m]["revenue"]
+            exp = month_map[m]["expense"]
+            profit = rev - exp
+            margin = (profit / rev * 100) if rev else 0.0
+            monthly_financials.append({
+                "month": m,
+                "revenue": round(rev, 2),
+                "expenses": round(exp, 2),
+                "profit": round(profit, 2),
+                "profit_margin": round(margin, 2),
+            })
+            revenues.append(rev)
+            expenses.append(exp)
+
+        total_rev = sum(revenues)
+        total_exp = sum(expenses)
+        overall_margin = (
+            (total_rev - total_exp) / total_rev * 100 if total_rev else 0.0
+        )
+
+        def _trend(values: List[float]) -> str:
+            if len(values) < 3:
+                return "stable"
+            first = statistics.mean(values[: len(values) // 2])
+            second = statistics.mean(values[len(values) // 2:])
+            if second > first * 1.05:
+                return "increasing"
+            if second < first * 0.95:
+                return "decreasing"
+            return "stable"
+
+        result.update({
+            "monthly_financials": monthly_financials,
+            "revenue_trend": _trend(revenues),
+            "expense_trend": _trend(expenses),
+            "profit_margin": round(overall_margin, 2),
+        })
+        return result
+
+    # ------------------------------------------------------------------
+    # Dashboard KPIs
+    # ------------------------------------------------------------------
+
+    def get_dashboard_kpis(self, company_id: int) -> dict:
+        """Return key performance indicators for executive dashboards.
+
+        Args:
+            company_id: Target company identifier.
+
+        Returns:
+            Dict with total_employees, saudi_percentage, average_salary,
+            total_payroll_cost, pending_invoices_amount,
+            leave_utilization_rate, headcount_growth and payroll_cost_ratio.
+        """
+        self._logger.info("Building dashboard KPIs for company %s", company_id)
+
+        # --- Total active employees ---
+        total_emps = self.db.fetchscalar(
+            "SELECT COUNT(*) FROM employees WHERE company_id = ? AND is_active = 1",
+            (company_id,),
+        ) or 0
+
+        # --- Saudi percentage (Nitaqat) ---
+        saudi_count = self.db.fetchscalar(
+            """SELECT COUNT(*) FROM employees
+               WHERE company_id = ? AND is_active = 1 AND is_saudi = 1""",
+            (company_id,),
+        ) or 0
+        saudi_pct = (saudi_count / total_emps * 100) if total_emps else 0.0
+
+        # --- Average salary ---
+        avg_salary = self.db.fetchscalar(
+            """SELECT AVG(basic_salary) FROM employees
+               WHERE company_id = ? AND is_active = 1""",
+            (company_id,),
+        ) or 0.0
+
+        # --- Latest payroll cost ---
+        latest = self.db.fetchone(
+            """
+            SELECT pr.total_gross
+              FROM payroll_runs pr
+              JOIN payroll_periods pp ON pp.id = pr.period_id
+             WHERE pp.company_id = ?
+               AND pr.status IN ('completed', 'approved', 'posted')
+             ORDER BY pp.period_year DESC, pp.period_month DESC
+             LIMIT 1
+            """,
+            (company_id,),
+        )
+        total_payroll = float(latest["total_gross"]) if latest else 0.0
+
+        # --- Pending invoices ---
+        pending_inv = self.db.fetchscalar(
+            """SELECT COALESCE(SUM(total_amount - COALESCE(paid_amount, 0)), 0)
+               FROM invoices
+               WHERE company_id = ? AND status IN ('sent', 'overdue', 'draft')""",
+            (company_id,),
+        ) or 0.0
+
+        # --- Leave utilization rate ---
+        today = datetime.date.today()
+        year_start = datetime.date(today.year, 1, 1).isoformat()
+        total_leave_taken = self.db.fetchscalar(
+            """
+            SELECT COALESCE(SUM(lr.total_days), 0)
+              FROM leave_requests lr
+              JOIN employees e ON e.id = lr.employee_id
+             WHERE e.company_id = ? AND lr.status = 'approved'
+               AND lr.start_date >= ?
+            """,
+            (company_id, year_start),
+        ) or 0
+        total_entitlement = total_emps * ANNUAL_LEAVE_DAYS
+        leave_util = (
+            float(total_leave_taken) / total_entitlement * 100
+            if total_entitlement > 0 else 0.0
+        )
+
+        # --- Headcount growth (last 3 months vs prior 3 months) ---
+        three_ago = (today - datetime.timedelta(days=90)).isoformat()
+        six_ago = (today - datetime.timedelta(days=180)).isoformat()
+        recent_hires = self.db.fetchscalar(
+            """SELECT COUNT(*) FROM employees
+               WHERE company_id = ? AND hire_date >= ?""",
+            (company_id, three_ago),
+        ) or 0
+        prior_hires = self.db.fetchscalar(
+            """SELECT COUNT(*) FROM employees
+               WHERE company_id = ? AND hire_date >= ? AND hire_date < ?""",
+            (company_id, six_ago, three_ago),
+        ) or 0
+        if prior_hires > 0:
+            hc_growth = (recent_hires - prior_hires) / prior_hires * 100
+        elif recent_hires > 0:
+            hc_growth = 100.0
+        else:
+            hc_growth = 0.0
+
+        # --- Payroll cost ratio (payroll / revenue) ---
+        monthly_rev = self.db.fetchscalar(
+            """
+            SELECT SUM(jel.credit - jel.debit) AS rev
+              FROM journal_entries je
+              JOIN journal_entry_lines jel ON jel.entry_id = je.id
+              JOIN chart_of_accounts coa ON coa.id = jel.account_id
+             WHERE coa.company_id = ?
+               AND coa.account_type = 'revenue'
+               AND je.status IN ('posted', 'approved')
+               AND je.entry_date >= ?
+            """,
+            (company_id, (today - datetime.timedelta(days=30)).isoformat()),
+        ) or 0.0
+        cost_ratio = (
+            (total_payroll / float(monthly_rev) * 100)
+            if monthly_rev else 0.0
+        )
+
+        return {
+            "total_employees": total_emps,
+            "saudi_percentage": round(saudi_pct, 2),
+            "average_salary": round(float(avg_salary), 2),
+            "total_payroll_cost": round(total_payroll, 2),
+            "pending_invoices_amount": round(float(pending_inv), 2),
+            "leave_utilization_rate": round(leave_util, 2),
+            "headcount_growth": round(hc_growth, 2),
+            "payroll_cost_ratio": round(cost_ratio, 2),
+        }
+
+
+# =============================================================================
+# SECTION 10: DATABASE SEEDING
+# =============================================================================
+
+
+class DatabaseSeeder:
+    """Seeds the database with initial configuration data.
+
+    All public methods are static and accept a ``DatabaseManager`` instance as
+    the first argument.  Uses ``INSERT OR IGNORE`` throughout to remain
+    idempotent — safe to run repeatedly without duplicating data.
+    """
+
+    # ------------------------------------------------------------------
+    # Master entry-point
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def seed_all(db) -> None:
+        """Execute every seed method inside a single transaction.
+
+        Creates the default company first, then populates all reference
+        data (chart of accounts, roles, permissions, leave types, admin user).
+
+        Args:
+            db: A ``DatabaseManager`` instance.
+        """
+        logger = logging.getLogger("seeder.DatabaseSeeder")
+        logger.info("Starting full database seed …")
+
+        with db.transaction():
+            # Ensure a default company exists
+            existing = db.fetchscalar(
+                "SELECT id FROM companies WHERE id = 1"
+            )
+            if not existing:
+                db.execute(
+                    """
+                    INSERT OR IGNORE INTO companies
+                        (id, name, name_ar, commercial_registration, vat_number)
+                    VALUES (1, ?, ?, '0000000000', '300000000000003')
+                    """,
+                    (DEFAULT_COMPANY_NAME, DEFAULT_COMPANY_NAME),
+                )
+            company_id = 1
+
+            DatabaseSeeder.seed_chart_of_accounts(db, company_id)
+            DatabaseSeeder.seed_roles_and_permissions(db)
+            DatabaseSeeder.seed_leave_types(db, company_id)
+            DatabaseSeeder.seed_admin_user(db, company_id)
+
+        logger.info("Database seed completed successfully.")
+
+    # ------------------------------------------------------------------
+    # Chart of Accounts
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def seed_chart_of_accounts(db, company_id: int) -> None:
+        """Insert a full Saudi-centric chart of accounts (80+ accounts).
+
+        Accounts follow the standard Saudi numbering convention:
+        1xxx Assets, 2xxx Liabilities, 3xxx Equity, 4xxx Revenue,
+        5xxx Expenses.  Header accounts (``is_header=1``) act as parents;
+        posting accounts (``is_header=0``) are used in journal entries.
+
+        Args:
+            db: ``DatabaseManager`` instance.
+            company_id: Company to associate the accounts with.
+        """
+        logger = logging.getLogger("seeder.DatabaseSeeder")
+        logger.info("Seeding chart of accounts for company %s", company_id)
+
+        # (code, name, type, normal_balance, is_header, level, parent_code)
+        accounts = [
+            # ── Assets ──────────────────────────────────────────────
+            ("1000", "Assets", "asset", "debit", 1, 1, None),
+            ("1100", "Current Assets", "asset", "debit", 1, 2, "1000"),
+            ("1110", "Cash", "asset", "debit", 1, 3, "1100"),
+            ("1111", "Cash in Hand", "asset", "debit", 0, 4, "1110"),
+            ("1112", "Cash in Bank", "asset", "debit", 0, 4, "1110"),
+            ("1120", "Accounts Receivable", "asset", "debit", 0, 3, "1100"),
+            ("1130", "Employee Advances", "asset", "debit", 0, 3, "1100"),
+            ("1140", "Prepaid Expenses", "asset", "debit", 0, 3, "1100"),
+            ("1150", "Inventory", "asset", "debit", 0, 3, "1100"),
+            ("1200", "Non-Current Assets", "asset", "debit", 1, 2, "1000"),
+            ("1210", "Fixed Assets", "asset", "debit", 1, 3, "1200"),
+            ("1211", "Furniture & Equipment", "asset", "debit", 0, 4, "1210"),
+            ("1212", "Vehicles", "asset", "debit", 0, 4, "1210"),
+            ("1213", "Computer Equipment", "asset", "debit", 0, 4, "1210"),
+            ("1215", "Accumulated Depreciation", "asset", "credit", 0, 4, "1210"),
+            ("1220", "Intangible Assets", "asset", "debit", 0, 3, "1200"),
+            # ── Liabilities ─────────────────────────────────────────
+            ("2000", "Liabilities", "liability", "credit", 1, 1, None),
+            ("2100", "Current Liabilities", "liability", "credit", 1, 2, "2000"),
+            ("2110", "Accounts Payable", "liability", "credit", 0, 3, "2100"),
+            ("2120", "Accrued Expenses", "liability", "credit", 0, 3, "2100"),
+            ("2130", "GOSI Payable", "liability", "credit", 1, 3, "2100"),
+            ("2131", "GOSI Employer Payable", "liability", "credit", 0, 4, "2130"),
+            ("2132", "GOSI Employee Payable", "liability", "credit", 0, 4, "2130"),
+            ("2140", "VAT Payable", "liability", "credit", 0, 3, "2100"),
+            ("2150", "Employee Loans Payable", "liability", "credit", 0, 3, "2100"),
+            ("2160", "Salaries Payable", "liability", "credit", 0, 3, "2100"),
+            ("2170", "End of Service Payable", "liability", "credit", 0, 3, "2100"),
+            ("2200", "Non-Current Liabilities", "liability", "credit", 1, 2, "2000"),
+            ("2210", "Long-term Loans", "liability", "credit", 0, 3, "2200"),
+            # ── Equity ──────────────────────────────────────────────
+            ("3000", "Equity", "equity", "credit", 1, 1, None),
+            ("3100", "Capital", "equity", "credit", 0, 2, "3000"),
+            ("3200", "Retained Earnings", "equity", "credit", 0, 2, "3000"),
+            ("3300", "Current Year Earnings", "equity", "credit", 0, 2, "3000"),
+            ("3400", "Reserves", "equity", "credit", 0, 2, "3000"),
+            # ── Revenue ─────────────────────────────────────────────
+            ("4000", "Revenue", "revenue", "credit", 1, 1, None),
+            ("4100", "Service Revenue", "revenue", "credit", 1, 2, "4000"),
+            ("4110", "Manpower Supply Revenue", "revenue", "credit", 0, 3, "4100"),
+            ("4120", "Recruitment Revenue", "revenue", "credit", 0, 3, "4100"),
+            ("4130", "Consulting Revenue", "revenue", "credit", 0, 3, "4100"),
+            ("4200", "Other Revenue", "revenue", "credit", 1, 2, "4000"),
+            ("4210", "Interest Income", "revenue", "credit", 0, 3, "4200"),
+            ("4220", "Miscellaneous Income", "revenue", "credit", 0, 3, "4200"),
+            # ── Expenses ────────────────────────────────────────────
+            ("5000", "Expenses", "expense", "debit", 1, 1, None),
+            ("5100", "Salary & Wages", "expense", "debit", 1, 2, "5000"),
+            ("5110", "Basic Salaries", "expense", "debit", 0, 3, "5100"),
+            ("5120", "Housing Allowances", "expense", "debit", 0, 3, "5100"),
+            ("5130", "Transport Allowances", "expense", "debit", 0, 3, "5100"),
+            ("5140", "Food Allowances", "expense", "debit", 0, 3, "5100"),
+            ("5150", "Other Allowances", "expense", "debit", 0, 3, "5100"),
+            ("5160", "Overtime", "expense", "debit", 0, 3, "5100"),
+            ("5170", "Bonuses", "expense", "debit", 0, 3, "5100"),
+            ("5200", "Employee Benefits", "expense", "debit", 1, 2, "5000"),
+            ("5210", "GOSI Employer Contribution", "expense", "debit", 0, 3, "5200"),
+            ("5220", "Medical Insurance", "expense", "debit", 0, 3, "5200"),
+            ("5230", "End of Service Provision", "expense", "debit", 0, 3, "5200"),
+            ("5240", "Leave Provision", "expense", "debit", 0, 3, "5200"),
+            ("5300", "Operating Expenses", "expense", "debit", 1, 2, "5000"),
+            ("5310", "Rent", "expense", "debit", 0, 3, "5300"),
+            ("5320", "Utilities", "expense", "debit", 0, 3, "5300"),
+            ("5330", "Communications", "expense", "debit", 0, 3, "5300"),
+            ("5340", "Office Supplies", "expense", "debit", 0, 3, "5300"),
+            ("5350", "Maintenance", "expense", "debit", 0, 3, "5300"),
+            ("5360", "Travel & Entertainment", "expense", "debit", 0, 3, "5300"),
+            ("5370", "Professional Fees", "expense", "debit", 0, 3, "5300"),
+            ("5380", "Marketing & Advertising", "expense", "debit", 0, 3, "5300"),
+            ("5400", "Administrative Expenses", "expense", "debit", 1, 2, "5000"),
+            ("5410", "Government Fees", "expense", "debit", 0, 3, "5400"),
+            ("5420", "Visa & Iqama Costs", "expense", "debit", 0, 3, "5400"),
+            ("5430", "Insurance", "expense", "debit", 0, 3, "5400"),
+            ("5440", "Bank Charges", "expense", "debit", 0, 3, "5400"),
+            ("5450", "Depreciation", "expense", "debit", 0, 3, "5400"),
+            ("5500", "Cost of Services", "expense", "debit", 0, 2, "5000"),
+        ]
+
+        code_to_id: Dict[str, int] = {}
+
+        # Pre-load any existing accounts to resolve parent references
+        existing = db.fetchall(
+            "SELECT id, account_code FROM chart_of_accounts WHERE company_id = ?",
+            (company_id,),
+        )
+        for row in (existing or []):
+            code_to_id[row["account_code"]] = row["id"]
+
+        for code, name, atype, normal, is_hdr, level, parent_code in accounts:
+            if code in code_to_id:
+                continue
+            parent_id = code_to_id.get(parent_code) if parent_code else None
+            db.execute(
+                """
+                INSERT OR IGNORE INTO chart_of_accounts
+                    (company_id, account_code, account_name, account_type,
+                     normal_balance, is_header, level, parent_id, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (company_id, code, name, atype, normal, is_hdr, level, parent_id),
+            )
+            # Retrieve the id for parent look-ups
+            new_id = db.fetchscalar(
+                "SELECT id FROM chart_of_accounts WHERE company_id = ? AND account_code = ?",
+                (company_id, code),
+            )
+            if new_id:
+                code_to_id[code] = new_id
+
+        logger.info("Chart of accounts seeded: %d accounts", len(accounts))
+
+    # ------------------------------------------------------------------
+    # Roles & Permissions
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def seed_roles_and_permissions(db) -> None:
+        """Create system roles and permissions, then map them.
+
+        Roles: Admin, HR Manager, Accountant, Employee.
+        Permissions cover modules: employee, payroll, accounting, invoice,
+        report, leave, settings, user.
+
+        Args:
+            db: ``DatabaseManager`` instance.
+        """
+        logger = logging.getLogger("seeder.DatabaseSeeder")
+        logger.info("Seeding roles and permissions")
+
+        # ── Roles ───────────────────────────────────────────────────
+        roles = [
+            ("admin", "Admin", "Full system administrator with unrestricted access", 1),
+            ("hr_manager", "HR Manager", "Manages employees, payroll processing and leave", 1),
+            ("accountant", "Accountant", "Handles accounting, invoicing and financial reports", 1),
+            ("employee", "Employee", "Self-service access to own data", 1),
+        ]
+        for name, display, desc, is_sys in roles:
+            db.execute(
+                """
+                INSERT OR IGNORE INTO roles (name, display_name, description, is_system, is_active)
+                VALUES (?, ?, ?, ?, 1)
+                """,
+                (name, display, desc, is_sys),
+            )
+
+        # ── Permissions ─────────────────────────────────────────────
+        permissions = [
+            # (code, name, module, action)
+            ("employee.view", "View Employees", "employee", "view"),
+            ("employee.create", "Create Employee", "employee", "create"),
+            ("employee.edit", "Edit Employee", "employee", "edit"),
+            ("employee.delete", "Delete Employee", "employee", "delete"),
+            ("payroll.view", "View Payroll", "payroll", "view"),
+            ("payroll.process", "Process Payroll", "payroll", "process"),
+            ("payroll.approve", "Approve Payroll", "payroll", "approve"),
+            ("accounting.view", "View Accounting", "accounting", "view"),
+            ("accounting.create", "Create Journal Entry", "accounting", "create"),
+            ("accounting.post", "Post Journal Entry", "accounting", "post"),
+            ("invoice.view", "View Invoices", "invoice", "view"),
+            ("invoice.create", "Create Invoice", "invoice", "create"),
+            ("invoice.post", "Post Invoice", "invoice", "post"),
+            ("report.view", "View Reports", "report", "view"),
+            ("report.export", "Export Reports", "report", "export"),
+            ("leave.view", "View Leave", "leave", "view"),
+            ("leave.request", "Request Leave", "leave", "request"),
+            ("leave.approve", "Approve Leave", "leave", "approve"),
+            ("settings.view", "View Settings", "settings", "view"),
+            ("settings.edit", "Edit Settings", "settings", "edit"),
+            ("user.view", "View Users", "user", "view"),
+            ("user.create", "Create User", "user", "create"),
+            ("user.edit", "Edit User", "user", "edit"),
+        ]
+        for code, pname, module, action in permissions:
+            db.execute(
+                """
+                INSERT OR IGNORE INTO permissions (code, name, module, action, description)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (code, pname, module, action, f"{action.title()} {module}"),
+            )
+
+        # ── Role → Permission mappings ──────────────────────────────
+        all_perm_codes = [p[0] for p in permissions]
+
+        hr_perms = [
+            "employee.view", "employee.create", "employee.edit", "employee.delete",
+            "payroll.view", "payroll.process",
+            "leave.view", "leave.request", "leave.approve",
+            "report.view",
+        ]
+
+        accountant_perms = [
+            "accounting.view", "accounting.create", "accounting.post",
+            "invoice.view", "invoice.create", "invoice.post",
+            "payroll.view",
+            "report.view", "report.export",
+        ]
+
+        employee_perms = [
+            "employee.view",
+            "leave.view", "leave.request",
+            "payroll.view",
+        ]
+
+        mapping: Dict[str, List[str]] = {
+            "admin": all_perm_codes,
+            "hr_manager": hr_perms,
+            "accountant": accountant_perms,
+            "employee": employee_perms,
+        }
+
+        for role_name, perm_codes in mapping.items():
+            role_row = db.fetchone(
+                "SELECT id FROM roles WHERE name = ?", (role_name,)
+            )
+            if not role_row:
+                continue
+            role_id = role_row["id"]
+            for pcode in perm_codes:
+                perm_row = db.fetchone(
+                    "SELECT id FROM permissions WHERE code = ?", (pcode,)
+                )
+                if not perm_row:
+                    continue
+                db.execute(
+                    "INSERT OR IGNORE INTO role_permissions (role_id, permission_id) VALUES (?, ?)",
+                    (role_id, perm_row["id"]),
+                )
+
+        logger.info("Roles and permissions seeded.")
+
+    # ------------------------------------------------------------------
+    # Admin user
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def seed_admin_user(db, company_id: int) -> None:
+        """Create the default administrator user account.
+
+        Username ``admin`` with default password ``admin123`` (hashed).
+        The user is assigned the *Admin* role.
+
+        Args:
+            db: ``DatabaseManager`` instance.
+            company_id: Company to associate the admin with.
+        """
+        logger = logging.getLogger("seeder.DatabaseSeeder")
+        logger.info("Seeding admin user for company %s", company_id)
+
+        existing = db.fetchone(
+            "SELECT id FROM users WHERE username = ?", ("admin",)
+        )
+        if existing:
+            logger.info("Admin user already exists (id=%s), skipping.", existing["id"])
+            return
+
+        sec = SecurityManager(db)
+        hashed_pw = sec.hash_password("admin123")
+
+        db.execute(
+            """
+            INSERT OR IGNORE INTO users
+                (username, password_hash, email, full_name,
+                 company_id, is_active, is_admin)
+            VALUES (?, ?, ?, ?, ?, 1, 1)
+            """,
+            ("admin", hashed_pw, "admin@company.local",
+             "System Administrator", company_id),
+        )
+
+        admin_user = db.fetchone(
+            "SELECT id FROM users WHERE username = ?", ("admin",)
+        )
+        admin_role = db.fetchone(
+            "SELECT id FROM roles WHERE name = ?", ("admin",)
+        )
+        if admin_user and admin_role:
+            db.execute(
+                "INSERT OR IGNORE INTO user_roles (user_id, role_id) VALUES (?, ?)",
+                (admin_user["id"], admin_role["id"]),
+            )
+
+        logger.info("Admin user created successfully.")
+
+    # ------------------------------------------------------------------
+    # Leave types
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def seed_leave_types(db, company_id: int) -> None:
+        """Populate leave types per Saudi Labour Law.
+
+        Types: Annual, Sick, Emergency, Hajj, Maternity, Paternity, Unpaid.
+        Uses ``INSERT OR IGNORE`` keyed on ``(company_id, code)`` uniqueness
+        (or plain IGNORE if constraint differs).
+
+        Args:
+            db: ``DatabaseManager`` instance.
+            company_id: Company to associate leave types with.
+        """
+        logger = logging.getLogger("seeder.DatabaseSeeder")
+        logger.info("Seeding leave types for company %s", company_id)
+
+        leave_types = [
+            {
+                "company_id": company_id,
+                "code": "ANNUAL",
+                "name": "Annual Leave",
+                "name_ar": "إجازة سنوية",
+                "days_per_year": ANNUAL_LEAVE_DAYS,
+                "is_paid": 1,
+                "is_carry_forward": 1,
+                "max_carry_forward_days": 15,
+                "requires_approval": 1,
+                "min_advance_days": 30,
+                "max_consecutive_days": 21,
+                "applicable_gender": "both",
+                "is_active": 1,
+                "description": "Annual leave per Saudi Labour Law Art. 109. "
+                               "21 days for < 5 yrs service, 30 days thereafter.",
+            },
+            {
+                "company_id": company_id,
+                "code": "SICK",
+                "name": "Sick Leave",
+                "name_ar": "إجازة مرضية",
+                "days_per_year": 30,
+                "is_paid": 1,
+                "is_carry_forward": 0,
+                "max_carry_forward_days": 0,
+                "requires_approval": 1,
+                "min_advance_days": 0,
+                "max_consecutive_days": 30,
+                "applicable_gender": "both",
+                "is_active": 1,
+                "description": "Sick leave per Saudi Labour Law Art. 117. "
+                               "First 30 days full pay; 60 days at 75%; 30 days unpaid.",
+            },
+            {
+                "company_id": company_id,
+                "code": "EMERGENCY",
+                "name": "Emergency Leave",
+                "name_ar": "إجازة طارئة",
+                "days_per_year": 5,
+                "is_paid": 1,
+                "is_carry_forward": 0,
+                "max_carry_forward_days": 0,
+                "requires_approval": 1,
+                "min_advance_days": 0,
+                "max_consecutive_days": 5,
+                "applicable_gender": "both",
+                "is_active": 1,
+                "description": "Emergency leave for unforeseen circumstances. "
+                               "No advance notice required.",
+            },
+            {
+                "company_id": company_id,
+                "code": "HAJJ",
+                "name": "Hajj Leave",
+                "name_ar": "إجازة حج",
+                "days_per_year": 15,
+                "is_paid": 1,
+                "is_carry_forward": 0,
+                "max_carry_forward_days": 0,
+                "requires_approval": 1,
+                "min_advance_days": 30,
+                "max_consecutive_days": 15,
+                "applicable_gender": "both",
+                "is_active": 1,
+                "description": "Hajj leave per Saudi Labour Law Art. 114. "
+                               "Once during employment, min 2 years service.",
+            },
+            {
+                "company_id": company_id,
+                "code": "MATERNITY",
+                "name": "Maternity Leave",
+                "name_ar": "إجازة أمومة",
+                "days_per_year": 70,
+                "is_paid": 1,
+                "is_carry_forward": 0,
+                "max_carry_forward_days": 0,
+                "requires_approval": 1,
+                "min_advance_days": 14,
+                "max_consecutive_days": 70,
+                "applicable_gender": "female",
+                "is_active": 1,
+                "description": "Maternity leave per Saudi Labour Law Art. 151. "
+                               "10 weeks (4 before + 6 after delivery).",
+            },
+            {
+                "company_id": company_id,
+                "code": "PATERNITY",
+                "name": "Paternity Leave",
+                "name_ar": "إجازة أبوة",
+                "days_per_year": 3,
+                "is_paid": 1,
+                "is_carry_forward": 0,
+                "max_carry_forward_days": 0,
+                "requires_approval": 1,
+                "min_advance_days": 0,
+                "max_consecutive_days": 3,
+                "applicable_gender": "male",
+                "is_active": 1,
+                "description": "Paternity leave for birth of a child. 3 days paid.",
+            },
+            {
+                "company_id": company_id,
+                "code": "UNPAID",
+                "name": "Unpaid Leave",
+                "name_ar": "إجازة بدون راتب",
+                "days_per_year": 30,
+                "is_paid": 0,
+                "is_carry_forward": 0,
+                "max_carry_forward_days": 0,
+                "requires_approval": 1,
+                "min_advance_days": 7,
+                "max_consecutive_days": 30,
+                "applicable_gender": "both",
+                "is_active": 1,
+                "description": "Unpaid leave by mutual agreement. "
+                               "Contract considered suspended during this period.",
+            },
+        ]
+
+        columns = [
+            "company_id", "code", "name", "name_ar", "days_per_year",
+            "is_paid", "is_carry_forward", "max_carry_forward_days",
+            "requires_approval", "min_advance_days", "max_consecutive_days",
+            "applicable_gender", "is_active", "description",
+        ]
+        placeholders = ", ".join(["?"] * len(columns))
+        col_str = ", ".join(columns)
+
+        for lt in leave_types:
+            values = tuple(lt[c] for c in columns)
+            db.execute(
+                f"INSERT OR IGNORE INTO leave_types ({col_str}) VALUES ({placeholders})",
+                values,
+            )
+
+        logger.info("Leave types seeded: %d types", len(leave_types))
+
