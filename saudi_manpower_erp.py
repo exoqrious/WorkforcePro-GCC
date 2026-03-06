@@ -7048,7 +7048,7 @@ class AIInsightsEngine(BaseService):
             avg_deductions = float(hist["avg_deductions"] or 0)
             reasons: List[str] = []
 
-            if avg_gross and abs(current_gross - avg_gross) / avg_gross > self._ANOMALY_PCT_THRESHOLD:
+            if avg_gross > 0 and abs(current_gross - avg_gross) / avg_gross > self._ANOMALY_PCT_THRESHOLD:
                 direction = "higher" if current_gross > avg_gross else "lower"
                 pct = abs(current_gross - avg_gross) / avg_gross * 100
                 reasons.append(
@@ -7204,9 +7204,10 @@ class AIInsightsEngine(BaseService):
                 """,
                 (emp["id"], (today - datetime.timedelta(days=365)).isoformat()),
             ) or 0
-            if float(avg_leave) > 0 and float(emp_leave) > float(avg_leave) * self._EXCESSIVE_LEAVE_FACTOR:
+            avg_leave_f = float(avg_leave)
+            if avg_leave_f > 0 and float(emp_leave) > avg_leave_f * self._EXCESSIVE_LEAVE_FACTOR:
                 risk_score += 25
-                factors.append(f"Excessive leave ({emp_leave} days vs avg {float(avg_leave):.1f})")
+                factors.append(f"Excessive leave ({emp_leave} days vs avg {avg_leave_f:.1f})")
 
             dept_id = emp["department_id"]
             dept_rate = dept_rates.get(dept_id, 0.0)
