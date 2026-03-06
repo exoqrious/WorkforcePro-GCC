@@ -4681,7 +4681,7 @@ class EOSBEngine(BaseService):
             return round(half_month_salary * years_of_service, 2)
 
         first_part = half_month_salary * EOSB_HALF_MONTH_YEARS
-        remaining_years = years_of_service - EOSB_FULL_MONTH_START
+        remaining_years = years_of_service - EOSB_HALF_MONTH_YEARS
         second_part = full_month_salary * remaining_years
         return round(first_part + second_part, 2)
 
@@ -4811,7 +4811,12 @@ class WPSEngine(BaseService):
 
     def _pad_left_zero(self, value: Union[int, float, str], length: int) -> str:
         """Pad a numeric value with leading zeros to the given length."""
-        return str(int(value)).zfill(length)[-length:]
+        s = str(int(value))
+        if len(s) > length:
+            self._logger.warning(
+                "Value %s exceeds %d digits; truncating", value, length,
+            )
+        return s.zfill(length)[-length:]
 
     def _format_amount(self, amount: float) -> str:
         """Format a monetary amount as a 15-character zero-padded string (2 decimal implied)."""
@@ -4865,10 +4870,10 @@ class WPSEngine(BaseService):
         for idx, entry in enumerate(payroll_entries):
             emp_ref = entry.get('emp_number', entry.get('employee_id', f'row-{idx}'))
 
-            iban = entry.get('bank_iban', '')
+            iban = str(entry.get('bank_iban', '') or '')
             if not iban:
                 errors.append(f"Employee {emp_ref}: missing bank IBAN")
-            elif not str(iban).startswith('SA') or len(str(iban)) != 24:
+            elif not iban.startswith('SA') or len(iban) != 24:
                 warnings.append(f"Employee {emp_ref}: IBAN '{iban}' may be invalid")
 
             net = float(entry.get('net_salary', 0))
